@@ -147,7 +147,7 @@ try {
         -NonInteractive `
         -PassThru `
         -SkipGraphConnect `
-        -NoLogo `
+        # -NoLogo `
         -ErrorAction Stop
     $runEnd = [datetime]::UtcNow
 } catch {
