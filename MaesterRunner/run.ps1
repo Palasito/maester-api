@@ -55,7 +55,10 @@ try {
 
 # ─── 3. Connect to Microsoft Graph ───────────────────────────────────────────
 try {
-    Connect-MgGraph -AccessToken $secureToken -NoWelcome -ErrorAction Stop
+    # -ContextScope Process keeps the Graph connection in-process memory only —
+    # it does NOT write .mg/mg.context.json to disk. This prevents file-lock
+    # collisions when multiple function invocations run concurrently.
+    Connect-MgGraph -AccessToken $secureToken -NoWelcome -ContextScope Process -ErrorAction Stop
 } catch {
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]::Unauthorized
