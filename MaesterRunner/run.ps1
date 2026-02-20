@@ -155,10 +155,10 @@ try {
     $runStart = [datetime]::UtcNow
     $results  = Invoke-Maester `
         -PesterConfiguration $pesterConfig `
+        -OutputFolder $invocationTempDir `
         -NonInteractive `
         -PassThru `
         -SkipGraphConnect `
-        # -NoLogo `
         -ErrorAction Stop
     $runEnd = [datetime]::UtcNow
 } catch {
@@ -228,7 +228,10 @@ $summary = [ordered]@{
 
 $responseBody = $summary | ConvertTo-Json -Depth 10 -Compress
 
-# ─── 11. Return response ─────────────────────────────────────────────────────
+# ─── 11. Clean up per-invocation temp directory ──────────────────────────────
+Remove-Item -Path $invocationTempDir -Recurse -Force -ErrorAction SilentlyContinue
+
+# ─── 12. Return response ─────────────────────────────────────────────────────
 Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
     StatusCode = [HttpStatusCode]::OK
     Body       = $responseBody
