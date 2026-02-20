@@ -55,10 +55,18 @@ try {
 
 # ─── 3. Connect to Microsoft Graph ───────────────────────────────────────────
 try {
-    # -ContextScope Process keeps the Graph connection in-process memory only —
-    # it does NOT write .mg/mg.context.json to disk. This prevents file-lock
-    # collisions when multiple function invocations run concurrently.
-    Connect-MgGraph -AccessToken $secureToken -NoWelcome -ContextScope Process -ErrorAction Stop
+    # Connect-MgGraph writes a context file to .mg/mg.context.json relative to
+    # the current working directory. To prevent file-lock collisions when multiple
+    # invocations run concurrently on the same instance, each invocation switches
+    # to its own unique temp directory before connecting, then restores cwd after.
+    $invocationTempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+    $null = New-Item -ItemType Directory -Path $invocationTempDir -Force
+    Push-Location $invocationTempDir
+    try {
+        Connect-MgGraph -AccessToken $secureToken -NoWelcome -ErrorAction Stop
+    } finally {
+        Pop-Location
+    }
 } catch {
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]::Unauthorized
