@@ -24,8 +24,9 @@ $VerbosePreference     = 'SilentlyContinue'
 # ─── Constants ────────────────────────────────────────────────────────────────
 # /home/ is persistent Azure Files storage on App Service; falls back to temp.
 $JOBS_DIR = if (Test-Path '/home') { '/home/maester-jobs' } else { Join-Path ([System.IO.Path]::GetTempPath()) 'maester-jobs' }
-$JOB_MAX_AGE_HOURS = 2     # Auto-cleanup threshold for old job files
-$JOB_STALE_MINUTES = 30    # Mark "running" jobs as timed-out after this
+$JOB_MAX_AGE_HOURS              = 2   # Hard upper bound — delete any file older than this
+$JOB_STALE_MINUTES              = 30  # Mark a "running" job as timed-out after this
+$JOB_COMPLETED_TIMEOUT_MINUTES  = 10  # Delete completed/failed files unread after this
 
 # Ensure jobs directory exists
 if (-not (Test-Path $JOBS_DIR)) {
@@ -95,6 +96,12 @@ if ($Request.Method -eq 'GET') {
         } catch { }
     }
 
+    # Delete the job file immediately if the run has reached a terminal state.
+    # Once the caller has received the result there is no reason to keep it on disk.
+    if ($jobData.status -in @('completed', 'failed')) {
+        Remove-Item -Path $jobFile -Force -ErrorAction SilentlyContinue
+    }
+
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]::OK
         Body       = ($jobData | ConvertTo-Json -Depth 12 -Compress)
@@ -162,10 +169,25 @@ Write-JobFile -Path $jobFile -Data ([ordered]@{
 
 # ─── 4. Cleanup old job files & finished thread jobs ─────────────────────────
 try {
-    $cutoff = (Get-Date).AddHours(-$JOB_MAX_AGE_HOURS)
-    Get-ChildItem -Path $JOBS_DIR -Filter '*.json' -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTimeUtc -lt $cutoff } |
-        Remove-Item -Force -ErrorAction SilentlyContinue
+    $hardCutoff      = (Get-Date).AddHours(-$JOB_MAX_AGE_HOURS)
+    $completedCutoff = (Get-Date).AddMinutes(-$JOB_COMPLETED_TIMEOUT_MINUTES)
+
+    foreach ($jsonFile in (Get-ChildItem -Path $JOBS_DIR -Filter '*.json' -ErrorAction SilentlyContinue)) {
+        # Hard upper bound — remove anything older than 2 hours regardless of state
+        if ($jsonFile.LastWriteTimeUtc -lt $hardCutoff) {
+            Remove-Item -Path $jsonFile.FullName -Force -ErrorAction SilentlyContinue
+            continue
+        }
+        # Soft timeout — remove completed/failed files the frontend never fetched
+        if ($jsonFile.LastWriteTimeUtc -lt $completedCutoff) {
+            try {
+                $d = Get-Content -Path $jsonFile.FullName -Raw | ConvertFrom-Json
+                if ($d.status -in @('completed', 'failed')) {
+                    Remove-Item -Path $jsonFile.FullName -Force -ErrorAction SilentlyContinue
+                }
+            } catch { }
+        }
+    }
 } catch { }
 
 try {
