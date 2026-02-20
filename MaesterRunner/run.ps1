@@ -151,13 +151,17 @@ if ($excludeTags.Count -gt 0) {
 }
 
 # ─── 7. Run Maester ──────────────────────────────────────────────────────────
+# We do NOT use -PassThru. Instead we rely on the JSON file Maester writes to
+# $invocationTempDir/results.json as the authoritative source of results.
+# This avoids depending on the in-memory Pester result object, which can be
+# $null or incomplete depending on Maester version and how tests exit.
 try {
     $runStart = [datetime]::UtcNow
-    $results  = Invoke-Maester `
+    Invoke-Maester `
         -PesterConfiguration $pesterConfig `
-        -OutputFolder $invocationTempDir `
+        -OutputFolder        $invocationTempDir `
+        -OutputJsonFileName  'results.json' `
         -NonInteractive `
-        -PassThru `
         -SkipGraphConnect `
         -ErrorAction Stop
     $runEnd = [datetime]::UtcNow
@@ -174,56 +178,68 @@ try {
 # ─── 8. Disconnect from Graph ────────────────────────────────────────────────
 Disconnect-MgGraph -ErrorAction SilentlyContinue
 
-# ─── 9. Flatten test results ─────────────────────────────────────────────────
+# ─── 9. Read Maester JSON output file ────────────────────────────────────────
+$jsonPath = Join-Path $invocationTempDir 'results.json'
+if (-not (Test-Path $jsonPath)) {
+    Remove-Item -Path $invocationTempDir -Recurse -Force -ErrorAction SilentlyContinue
+    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+        StatusCode = [HttpStatusCode]::InternalServerError
+        Body       = ([ordered]@{ error = "Maester did not produce a results file. Ensure the Maester module is installed and tests ran successfully." } | ConvertTo-Json -Compress)
+        Headers    = @{ 'Content-Type' = 'application/json' }
+    })
+    return
+}
+
+try {
+    $maesterJson = Get-Content -Path $jsonPath -Raw | ConvertFrom-Json
+} catch {
+    Remove-Item -Path $invocationTempDir -Recurse -Force -ErrorAction SilentlyContinue
+    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+        StatusCode = [HttpStatusCode]::InternalServerError
+        Body       = ([ordered]@{ error = "Failed to parse Maester results file: $($_.Exception.Message)" } | ConvertTo-Json -Compress)
+        Headers    = @{ 'Content-Type' = 'application/json' }
+    })
+    return
+}
+
+# ─── 10. Transform to PipePal response format ────────────────────────────────
 $flatTests = @()
-if ($results -and $results.Tests) {
-    foreach ($test in $results.Tests) {
-        # Extract severity from Tags (format: "Severity:High")
-        $severity = 'Info'
-        if ($test.Tag) {
-            $sevTag = $test.Tag | Where-Object { $_ -like 'Severity:*' } | Select-Object -First 1
-            if ($sevTag) { $severity = $sevTag -replace '^Severity:', '' }
-        }
+foreach ($test in $maesterJson.Tests) {
+    # Severity — Maester may expose it as a direct property or inside the Tag array
+    $severity = 'Info'
+    if ($test.Severity) {
+        $severity = $test.Severity
+    } elseif ($test.Tag) {
+        $sevTag = $test.Tag | Where-Object { $_ -like 'Severity:*' } | Select-Object -First 1
+        if ($sevTag) { $severity = $sevTag -replace '^Severity:', '' }
+    }
 
-        # Extract category from block hierarchy (first segment of block names)
-        $category = ''
-        if ($test.Block) {
-            $category = ($test.Block.Name -split '\.' | Select-Object -First 1)
-        }
+    # ID — prefer a tag that looks like a test ID (e.g. "EIDSCA.AP01", "MT.1001")
+    $testId = $test.Tag | Where-Object { $_ -match '^[A-Z]+(\.[A-Z0-9]+)+$' } | Select-Object -First 1
+    if (-not $testId) { $testId = $test.Name -replace '\s+', '-' }
 
-        $errorMsg = $null
-        if ($test.Result -eq 'Failed' -and $test.ErrorRecord) {
-            $errorMsg = $test.ErrorRecord.Exception.Message
-        }
-
-        $flatTests += [ordered]@{
-            id          = $test.Name -replace '\s+', '-'
-            name        = $test.Name
-            result      = $test.Result           # 'Passed','Failed','Skipped','NotRun'
-            duration    = [math]::Round($test.Duration.TotalMilliseconds)
-            severity    = $severity
-            category    = $category
-            block       = if ($test.Block) { $test.Block.Name } else { '' }
-            errorRecord = $errorMsg
-        }
+    $flatTests += [ordered]@{
+        id          = $testId
+        name        = $test.Name
+        result      = $test.Result
+        duration    = if ($test.Duration) { [math]::Round([double]$test.Duration) } else { 0 }
+        severity    = $severity
+        category    = if ($test.Block) { ($test.Block -split '[.\s]' | Select-Object -First 1).Trim() } else { '' }
+        block       = if ($test.Block) { $test.Block } else { '' }
+        errorRecord = if ($test.ErrorRecord) { [string]$test.ErrorRecord } else { $null }
     }
 }
 
-# ─── 10. Build response summary ──────────────────────────────────────────────
-$passedCount  = ($flatTests | Where-Object { $_.result -eq 'Passed'  }).Count
-$failedCount  = ($flatTests | Where-Object { $_.result -eq 'Failed'  }).Count
-$skippedCount = ($flatTests | Where-Object { $_.result -in @('Skipped','NotRun') }).Count
-
 $summary = [ordered]@{
-    totalCount    = $flatTests.Count
-    passedCount   = $passedCount
-    failedCount   = $failedCount
-    skippedCount  = $skippedCount
-    durationMs    = [math]::Round(($runEnd - $runStart).TotalMilliseconds)
-    timestamp     = $runStart.ToString('o')   # ISO 8601
-    suitesRun     = $suites
+    totalCount     = if ($maesterJson.TotalCount)   { $maesterJson.TotalCount }   else { $flatTests.Count }
+    passedCount    = if ($maesterJson.PassedCount)  { $maesterJson.PassedCount }  else { ($flatTests | Where-Object { $_.result -eq 'Passed'  }).Count }
+    failedCount    = if ($maesterJson.FailedCount)  { $maesterJson.FailedCount }  else { ($flatTests | Where-Object { $_.result -eq 'Failed'  }).Count }
+    skippedCount   = if ($maesterJson.SkippedCount -ne $null) { $maesterJson.SkippedCount + ($maesterJson.NotRunCount ?? 0) } else { ($flatTests | Where-Object { $_.result -in @('Skipped','NotRun') }).Count }
+    durationMs     = [math]::Round(($runEnd - $runStart).TotalMilliseconds)
+    timestamp      = if ($maesterJson.ExecutedAt)   { $maesterJson.ExecutedAt }   else { $runStart.ToString('o') }
+    suitesRun      = $suites
     severityFilter = $severities
-    tests         = $flatTests
+    tests          = $flatTests
 }
 
 $responseBody = $summary | ConvertTo-Json -Depth 10 -Compress
