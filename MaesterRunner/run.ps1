@@ -47,7 +47,7 @@ try {
 } catch {
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]::BadRequest
-        Body       = "{`"error`":`"Failed to parse request body: $($_.Exception.Message)`"}"
+        Body       = ([ordered]@{ error = "Failed to parse request body: $($_.Exception.Message)" } | ConvertTo-Json -Compress)
         Headers    = @{ 'Content-Type' = 'application/json' }
     })
     return
@@ -59,7 +59,7 @@ try {
 } catch {
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]::Unauthorized
-        Body       = "{`"error`":`"Failed to connect to Microsoft Graph: $($_.Exception.Message)`"}"
+        Body       = ([ordered]@{ error = "Failed to connect to Microsoft Graph: $($_.Exception.Message)" } | ConvertTo-Json -Compress)
         Headers    = @{ 'Content-Type' = 'application/json' }
     })
     return
@@ -83,19 +83,19 @@ try {
             }
             'eidsca' {
                 $modulePath = (Get-Module -Name Maester -ListAvailable | Select-Object -First 1).ModuleBase
-                if ($modulePath) { $allTestPaths += Join-Path $modulePath 'Tests\EIDSCA' }
+                if ($modulePath) { $allTestPaths += Join-Path $modulePath 'Tests' 'EIDSCA' }
             }
             'cis' {
                 $modulePath = (Get-Module -Name Maester -ListAvailable | Select-Object -First 1).ModuleBase
-                if ($modulePath) { $allTestPaths += Join-Path $modulePath 'Tests\CIS' }
+                if ($modulePath) { $allTestPaths += Join-Path $modulePath 'Tests' 'CIS' }
             }
             'cisa' {
                 $modulePath = (Get-Module -Name Maester -ListAvailable | Select-Object -First 1).ModuleBase
-                if ($modulePath) { $allTestPaths += Join-Path $modulePath 'Tests\CISA' }
+                if ($modulePath) { $allTestPaths += Join-Path $modulePath 'Tests' 'CISA' }
             }
             'orca' {
                 $modulePath = (Get-Module -Name Maester -ListAvailable | Select-Object -First 1).ModuleBase
-                if ($modulePath) { $allTestPaths += Join-Path $modulePath 'Tests\ORCA' }
+                if ($modulePath) { $allTestPaths += Join-Path $modulePath 'Tests' 'ORCA' }
             }
         }
     }
@@ -110,7 +110,7 @@ try {
     Disconnect-MgGraph -ErrorAction SilentlyContinue
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]::InternalServerError
-        Body       = "{`"error`":`"Failed to resolve test paths: $($_.Exception.Message)`"}"
+        Body       = ([ordered]@{ error = "Failed to resolve test paths: $($_.Exception.Message)" } | ConvertTo-Json -Compress)
         Headers    = @{ 'Content-Type' = 'application/json' }
     })
     return
@@ -154,7 +154,7 @@ try {
     Disconnect-MgGraph -ErrorAction SilentlyContinue
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]::InternalServerError
-        Body       = "{`"error`":`"Maester run failed: $($_.Exception.Message)`"}"
+        Body       = ([ordered]@{ error = "Maester run failed: $($_.Exception.Message)" } | ConvertTo-Json -Compress)
         Headers    = @{ 'Content-Type' = 'application/json' }
     })
     return
