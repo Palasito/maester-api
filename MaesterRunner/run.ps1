@@ -117,7 +117,7 @@ if ($Request.Method -eq 'GET') {
 if ($Request.Method -ne 'POST') {
     Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
         StatusCode = [HttpStatusCode]::MethodNotAllowed
-        Body       = '{"error":"Method not allowed. Use POST to start a run or GET to poll status."}'
+        Body       = {error="Method not allowed. Use POST to start a run or GET to poll status."}
         Headers    = @{ 'Content-Type' = 'application/json' }
     })
     return
@@ -253,7 +253,11 @@ $null = Start-ThreadJob -Name "maester-$jobId" -ArgumentList @(
     $invocationTempDir = $null
 
     try {
-        # ── Import modules (thread runspace starts clean) ─────────────────────
+        # ── Import modules ────────────────────────────────────────────────────
+        # Thread runspaces start clean so explicit Import-Module is required.
+        # Modules are pre-installed to /home/site/modules/ by profile.ps1 and
+        # that path is registered in $env:PSModulePath, so these resolve from
+        # disk instantly (no download, no managed-dependency delay).
         Import-Module -Name Microsoft.Graph.Authentication -ErrorAction Stop
         Import-Module -Name Pester -ErrorAction Stop
         Import-Module -Name Maester -ErrorAction Stop
