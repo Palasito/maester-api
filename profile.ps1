@@ -7,12 +7,26 @@
 # served. Instead we install once here — subsequent cold starts see the modules
 # already on disk and skip installation entirely (< 1 second overhead).
 #
+# Docker: When MAESTER_MODULES_PREINSTALLED=true, modules are baked into the
+# image at build time (see Dockerfile). This block registers the path and
+# returns immediately — zero install overhead, zero network calls.
+#
 # To upgrade a module: bump the version stamp in $MODULE_STAMP below and the
 # next cold start will re-install everything fresh.
 
 $ErrorActionPreference = 'Stop'
 $VerbosePreference     = 'SilentlyContinue'
 $ProgressPreference    = 'SilentlyContinue'
+
+# ─── Docker fast-path: modules are pre-installed at image build time ──────────
+if ($env:MAESTER_MODULES_PREINSTALLED -eq 'true') {
+    $dockerModulesPath = if ($env:MAESTER_MODULES_PATH) { $env:MAESTER_MODULES_PATH } else { '/opt/modules' }
+    if ($env:PSModulePath -notlike "*$dockerModulesPath*") {
+        $env:PSModulePath = $dockerModulesPath + [System.IO.Path]::PathSeparator + $env:PSModulePath
+    }
+    Write-Host "[profile] Docker mode - using pre-installed modules at $dockerModulesPath"
+    return
+}
 
 # ─── Persistent module path (Azure Files, survives restarts) ──────────────────
 # Falls back to a temp directory when running locally (no /home mount).

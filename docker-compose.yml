@@ -1,0 +1,31 @@
+services:
+
+  # ─── maester-api (PowerShell Core on Alpine + Pode HTTP server) ───────────
+  # Single service — no Azure Functions host, no Azurite storage emulator.
+  # Port mapping: host:7071 → container:80  (matches PipePal proxy expectations)
+  # SQLite at /tmp/maester.db — ephemeral, no persistent volume by default.
+  maester-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "7071:80"
+    environment:
+      # API key for proxy authentication (matches PipePal's x-functions-key)
+      - MAESTER_API_KEY=${MAESTER_API_KEY:-local-dev-key}
+      # Optional: override SQLite path for persistence
+      # - MAESTER_DB_PATH=/data/maester.db
+    # volumes:
+    #   - maester-data:/data     # Uncomment for persistent DB across restarts
+    restart: unless-stopped
+    healthcheck:
+      # Use native wget instead of pwsh to avoid spawning a full PowerShell
+      # process (~80-100 MB) every 30 seconds for health checks.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s   # Allow time for Pode to start
+
+# volumes:
+#   maester-data:                # Uncomment if persistence is desired

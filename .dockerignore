@@ -1,0 +1,32 @@
+# ─── maester-api Docker build context exclusions ──────────────────────────────
+
+# Version control
+.git
+.gitignore
+.github
+
+# Documentation
+README.md
+LICENSE
+docs/
+
+# Docker files (don't copy into image)
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# IDE / editor
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Local environment files (secrets — never bake into image)
+.env
+.env.*
+local.settings.json
