@@ -1,7 +1,16 @@
-# Docs for the Azure Functions Deploy action: https://github.com/Azure/functions-action
-# More GitHub Actions for Azure: https://github.com/Azure/actions
+# Build, push to ACR, and deploy to Azure Function App (maester-api)
+# Triggers on push to main or manual dispatch.
+#
+# Prerequisites (one-time setup):
+#   1. ACR: acrpalprod (acrpalprod-b2dsfkb7a7brc6gf.azurecr.io)
+#   2. GitHub repo secrets:
+#      - AZUREAPPSERVICE_CLIENTID_33953DB3ADB64EE1AFC79D92F8BA5ACF
+#      - AZUREAPPSERVICE_TENANTID_DA31D7DBE41749919960575C96487AD2
+#      - AZUREAPPSERVICE_SUBSCRIPTIONID_55ED9CCF3B6940E193205FD0C178EB98
+#   3. The OIDC service principal must have AcrPush role on the ACR
+#   4. Function App Deployment Center configured to pull from ACR
 
-name: Build and deploy container app to Azure Functions - maester-api
+name: Build and deploy maester-api to Azure Functions
 
 on:
   push:
@@ -9,43 +18,21 @@ on:
       - main
   workflow_dispatch:
 
+env:
+  ACR_LOGIN_SERVER: acrpalprod-b2dsfkb7a7brc6gf.azurecr.io
+  IMAGE_NAME: maester-api
+  FUNCTION_APP_NAME: maester-api
+
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      id-token: write   # OIDC token for Azure login
+      contents: read     # Checkout repo
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-
-      - name: Log in to container registry
-        uses: docker/login-action@v2
-        with:
-          registry: mcr.microsoft.com/
-          username: ${{ secrets.AZUREAPPSERVICE_CONTAINERUSERNAME_B9244505EDD44314B86B7FB6119F2EE2 }}
-          password: ${{ secrets.AZUREAPPSERVICE_CONTAINERPASSWORD_6369E5F8D8BF4934AA6E4B5ED88BC687 }}
-
-      - name: Build and push container image to registry
-        uses: docker/build-push-action@v3
-        with:
-          context: .
-          push: true
-          tags: mcr.microsoft.com/${{ secrets.AZUREAPPSERVICE_CONTAINERUSERNAME_B9244505EDD44314B86B7FB6119F2EE2 }}/azure-functions/dotnet:${{ github.sha }}
-          file: ./Dockerfile
-
-  deploy:
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write #This is required for requesting the JWT
-      contents: read #This is required for actions/checkout
-
-    needs: build
-    
-    steps:
-      
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -53,11 +40,26 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_DA31D7DBE41749919960575C96487AD2 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_55ED9CCF3B6940E193205FD0C178EB98 }}
 
+      - name: Login to ACR
+        run: az acr login --name acrpalprod
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image to ACR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+
       - name: Deploy to Azure Functions
-        id: deploy-to-functions
         uses: azure/functions-deploy@v2
         with:
-          app-name: 'maester-api'
+          app-name: ${{ env.FUNCTION_APP_NAME }}
           slot-name: 'Production'
-          images: 'mcr.microsoft.com/${{ secrets.AZUREAPPSERVICE_CONTAINERUSERNAME_B9244505EDD44314B86B7FB6119F2EE2 }}/azure-functions/dotnet:${{ github.sha }}'
+          images: '${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}'
           

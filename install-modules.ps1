@@ -24,6 +24,7 @@ Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
 #   Microsoft.Graph.Authentication  — Graph API connection
 #   ExchangeOnlineManagement        — Exchange Online tests (Maester ORCA suite)
 #   MicrosoftTeams                  — Teams configuration tests
+#   Az.Accounts                     — Azure connection (CIS Azure, XSPM, etc.)
 #   PSSQLite                        — SQLite data access for job persistence
 #   Maester                         — M365 security test framework
 #   NOTE: Microsoft.PowerShell.ThreadJob is NOT installed — we use Start-Job
@@ -35,6 +36,7 @@ $modules = @(
     'Microsoft.Graph.Authentication'
     'ExchangeOnlineManagement'
     'MicrosoftTeams'
+    'Az.Accounts'
     'PSSQLite'
     'Maester'
 )

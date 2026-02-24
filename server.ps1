@@ -3,14 +3,13 @@
 # Thin orchestrator that delegates to lib/ modules for all business logic.
 # Replaces the Azure Functions host when running in Docker.
 #
-# API contract (backward-compatible with Azure Functions backend):
+# API contract:
 #
 #   POST /api/MaesterRunner
-#     Auth (one of):
-#       X-Maester-Client-Id: <clientId>   \  App-reg path: backend acquires
-#       X-Maester-Client-Secret: <secret>  /  all tokens via client_credentials
-#       — OR —
-#       Authorization: Bearer <graphToken>    (delegated path, no app reg)
+#     Authorization: Bearer <graphToken>    (device code delegated token)
+#     X-Exchange-Token: <token>             (optional, for Exchange Online tests)
+#     X-Teams-Token: <token>                (optional, for Microsoft Teams tests)
+#     X-IPPS-Token: <token>                 (optional, for Security & Compliance tests)
 #     X-Functions-Key: <apiKey>   (or X-Api-Key)
 #     Body: { suites, severity?, tags?, includeLongRunning?, includePreview?,
 #             tenantId?, includeExchange?, includeTeams? }
@@ -49,6 +48,7 @@ Write-Host '[server] Loading lib/ modules...'
 . /app/lib/auth.ps1
 . /app/lib/result-transformer.ps1
 . /app/lib/maester-runner.ps1
+. /app/lib/inventory-builder.ps1
 Write-Host '[server] lib/ modules loaded.'
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -81,6 +81,19 @@ try {
     }
 } catch {
     Write-Host "[server] WARNING: Test refresh failed ($($_.Exception.Message)). Using build-time tests."
+}
+
+# ─── Build test inventory (cached for container lifetime) ─────────────────────
+# Inventory is built once at startup from maester-config.json + directory
+# structure. It only changes when the container restarts (Install-MaesterTests).
+Write-Host '[server] Building test inventory ...'
+try {
+    $INVENTORY_CACHE = Build-MaesterInventory -TestsPath $MAESTER_TESTS_PATH
+    $INVENTORY_JSON  = $INVENTORY_CACHE | ConvertTo-Json -Depth 12
+    Write-Host '[server] Test inventory cached.'
+} catch {
+    Write-Host "[server] WARNING: Inventory build failed ($($_.Exception.Message)). /api/inventory will return 503."
+    $INVENTORY_JSON = $null
 }
 
 # ─── Initialise SQLite ────────────────────────────────────────────────────────
@@ -134,6 +147,21 @@ Start-PodeServer -Threads 1 {
             dbConnected = $dbOk
             activeJobs  = $activeJobs
         })
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # GET /api/inventory — Return cached test inventory JSON
+    # ══════════════════════════════════════════════════════════════════════════
+    Add-PodeRoute -Method Get -Path '/api/inventory' -ScriptBlock {
+        $json = $using:INVENTORY_JSON
+
+        if (-not $json) {
+            $WebEvent.Response.StatusCode = 503
+            Write-PodeJsonResponse -Value @{ error = 'Inventory not available — build failed at startup.' }
+            return
+        }
+
+        Write-PodeTextResponse -Value $json -ContentType 'application/json'
     }
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -236,36 +264,21 @@ Start-PodeServer -Threads 1 {
         Import-Module PSSQLite -ErrorAction SilentlyContinue
         . /app/lib/auth.ps1
 
-        # ── 1. Extract app credentials from headers OR bearer token ─────────
-        #
-        # App-reg path (preferred): client ID + secret arrive as custom headers.
-        # The PowerShell runner acquires ALL tokens (Graph, Exchange, Teams)
-        # itself via client_credentials — no delegated token needed.
-        #
-        # Delegated path (fallback): Authorization: Bearer <graphToken> is used
-        # when no Maester app registration is configured in the tenant.
-        $maesterClientId     = $WebEvent.Request.Headers['X-Maester-Client-Id']
-        $maesterClientSecret = $WebEvent.Request.Headers['X-Maester-Client-Secret']
-        $usingAppCreds       = ($maesterClientId -and $maesterClientSecret)
-
-        if ($usingAppCreds) {
-            $rawToken = ''  # runner acquires its own Graph token via client_credentials
-            Write-Host '[server] POST: using app-reg credentials path (no delegated token)'
-        } else {
-            $rawToken = Get-BearerToken -Headers $WebEvent.Request.Headers
-            if (-not $rawToken) {
-                $WebEvent.Response.StatusCode = 401
-                Write-PodeJsonResponse -Value @{
-                    error = 'Missing authentication. Provide either X-Maester-Client-Id + X-Maester-Client-Secret headers, or Authorization: Bearer <token>.'
-                }
-                return
+        # ── 1. Extract bearer token (device code delegated flow) ─────────────
+        $rawToken = Get-BearerToken -Headers $WebEvent.Request.Headers
+        if (-not $rawToken) {
+            $WebEvent.Response.StatusCode = 401
+            Write-PodeJsonResponse -Value @{
+                error = 'Missing authentication. Provide Authorization: Bearer <token>.'
             }
+            return
         }
 
-        # ── 1a. Extract optional Phase 3 tokens (Exchange / Teams) ───────────
-        # Only relevant on the delegated path — app-reg path handles these itself.
-        $exchangeToken = $WebEvent.Request.Headers['X-Exchange-Token']
-        $teamsToken    = $WebEvent.Request.Headers['X-Teams-Token']
+        # ── 1a. Extract optional app-registration credentials ──────────────────
+        # The runner uses these to acquire all service tokens (Exchange, IPPS,
+        # Teams, Azure) itself via client_credentials grant.
+        $maesterClientId     = $WebEvent.Request.Headers['X-Maester-Client-Id']
+        $maesterClientSecret = $WebEvent.Request.Headers['X-Maester-Client-Secret']
 
         # ── 2. Parse request body ────────────────────────────────────────────
         try {
@@ -281,18 +294,6 @@ Start-PodeServer -Threads 1 {
             # Phase 3: tenantId needed for Exchange Online connection (-Organization)
             $tenantId       = if ($body.tenantId) { [string]$body.tenantId } else { '' }
 
-            # App credentials come from headers (set above). The body no longer
-            # carries maesterAppCredentials — kept here as a backward-compat
-            # fallback in case an older client still sends them in the body.
-            if (-not $usingAppCreds) {
-                $fallbackId     = if ($body.maesterAppCredentials.clientId)     { [string]$body.maesterAppCredentials.clientId }     else { '' }
-                $fallbackSecret = if ($body.maesterAppCredentials.clientSecret) { [string]$body.maesterAppCredentials.clientSecret } else { '' }
-                if ($fallbackId -and $fallbackSecret) {
-                    $maesterClientId     = $fallbackId
-                    $maesterClientSecret = $fallbackSecret
-                    Write-Host '[server] POST: app credentials received from body (legacy fallback)'
-                }
-            }
         } catch {
             $WebEvent.Response.StatusCode = 400
             Write-PodeJsonResponse -Value ([ordered]@{ error = "Failed to parse request body: $($_.Exception.Message)" })
@@ -358,7 +359,7 @@ Start-PodeServer -Threads 1 {
         $null = Start-Job -Name "maester-$jobId" -ScriptBlock $runnerScriptBlock -ArgumentList @(
             $rawToken, $suites, $severities, $extraTags,
             $incLongRunning, $incPreview, $jobId, $dbPath,
-            $exchangeToken, $teamsToken, $tenantId, $testsPath,
+            $tenantId, $testsPath,
             $maesterClientId, $maesterClientSecret
         )
 

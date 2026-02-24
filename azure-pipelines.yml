@@ -1,0 +1,88 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# Build, push to ACR, and deploy maester-api to Azure Function App
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Prerequisites (one-time setup):
+#   1. ACR: acrpalprod (acrpalprod-b2dsfkb7a7brc6gf.azurecr.io)
+#   2. Azure DevOps Service Connection named 'AzureServiceConnection'
+#      - Type: Azure Resource Manager (Workload Identity Federation or SP)
+#      - Must have AcrPush role on ACR + Contributor on Function App
+#   3. Function App Deployment Center configured to pull from ACR
+#
+# Triggers on push to main branch.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr: none   # Don't trigger on PRs — only build on merge to main
+
+variables:
+  azureSubscription: 'AzureServiceConnection'   # Name of your Azure DevOps service connection
+  acrLoginServer: 'acrpalprod-b2dsfkb7a7brc6gf.azurecr.io'
+  acrName: 'acrpalprod'
+  imageName: 'maester-api'
+  functionAppName: 'maester-api'
+  imageTag: '$(Build.SourceVersion)'             # Git commit SHA
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  # ── Stage 1: Build & Push ──────────────────────────────────────────────────
+  - stage: Build
+    displayName: 'Build & Push Docker Image'
+    jobs:
+      - job: BuildAndPush
+        displayName: 'Docker Build → ACR'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Login to ACR'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az acr login --name $(acrName)
+
+          - task: Docker@2
+            displayName: 'Build and push image'
+            inputs:
+              containerRegistry: $(azureSubscription)
+              repository: $(imageName)
+              command: 'buildAndPush'
+              Dockerfile: './Dockerfile'
+              buildContext: '.'
+              tags: |
+                $(imageTag)
+                latest
+
+  # ── Stage 2: Deploy ────────────────────────────────────────────────────────
+  - stage: Deploy
+    displayName: 'Deploy to Function App'
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - deployment: DeployToFunctionApp
+        displayName: 'Deploy maester-api'
+        environment: 'production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: 'Update Function App container image'
+                  inputs:
+                    azureSubscription: $(azureSubscription)
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      az functionapp config container set \
+                        --name $(functionAppName) \
+                        --resource-group $(az functionapp show --name $(functionAppName) --query resourceGroup -o tsv) \
+                        --image $(acrLoginServer)/$(imageName):$(imageTag) \
+                        --registry-server https://$(acrLoginServer)

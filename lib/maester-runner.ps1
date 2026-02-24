@@ -8,12 +8,15 @@
 # of Maester/Pester/Graph module assemblies are fully reclaimed by the OS when
 # the child process exits — keeping the long-running Pode server process lean.
 #
-# Phase 1: Graph-only authentication.
-# Phase 3: adds Exchange Online + Microsoft Teams (optional headers).
+# Auth model: app-registration only (client_credentials grant).
+# The runner acquires all service tokens itself using the supplied client ID +
+# secret.  No delegated / device-code tokens are forwarded by the caller.
+# Services covered: Microsoft Graph, Exchange Online, Security & Compliance
+# (IPPS), Microsoft Teams, and Azure (Az.Accounts).
 
 $MaesterRunnerScriptBlock = {
     param(
-        [string]   $GraphToken,
+        [string]   $GraphToken,            # MSAL workspace Graph token (proxy-route auth + Connect-MgGraph)
         [string[]] $Suites,
         [string[]] $Severities,
         [string[]] $ExtraTags,
@@ -21,23 +24,44 @@ $MaesterRunnerScriptBlock = {
         [bool]     $IncPreview,
         [string]   $JobId,
         [string]   $DbPath,
-        # Phase 3 — optional tokens for Exchange Online & Teams tests
-        [string]   $ExchangeToken,         # Access token for https://outlook.office365.com (delegated)
-        [string]   $TeamsToken,             # Access token for Teams resource (delegated)
-        [string]   $TenantId,              # Customer tenant ID (required for Exchange connection)
+        [string]   $TenantId,              # Customer tenant ID (required for all service connections)
         [string]   $TestsPath,             # Path to Install-MaesterTests output (fallback: module built-in)
-        # App-credentials path (client_credentials flow) — preferred over delegated tokens
-        [string]   $MaesterClientId,       # App registration client ID in customer tenant
-        [string]   $MaesterClientSecret    # Client secret (session-only, never persisted)
+        # App-registration credentials — runner acquires all service tokens itself
+        [string]   $MaesterClientId,       # Application (client) ID of the Maester app registration
+        [string]   $MaesterClientSecret    # Client secret value
     )
 
     $ErrorActionPreference = 'Stop'
     $ProgressPreference    = 'SilentlyContinue'
     $VerbosePreference     = 'SilentlyContinue'
 
-    # ── Local helper: update job in SQLite ────────────────────────────────────
-    # We inline a minimal update function so the scriptblock stays self-contained
-    # (thread jobs cannot call functions from the parent scope).
+    # ── Local helpers ─────────────────────────────────────────────────────────
+    # Inlined so the scriptblock stays self-contained (child processes cannot
+    # call functions from the parent scope).
+
+    # Acquire an app-only access token via the OAuth 2.0 client_credentials grant.
+    function Get-ClientCredentialToken {
+        param(
+            [string] $TenantId,
+            [string] $ClientId,
+            [string] $ClientSecret,
+            [string] $Scope
+        )
+        $body = @{
+            grant_type    = 'client_credentials'
+            client_id     = $ClientId
+            client_secret = $ClientSecret
+            scope         = $Scope
+        }
+        $resp = Invoke-RestMethod `
+            -Uri         "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+            -Method      POST `
+            -ContentType 'application/x-www-form-urlencoded' `
+            -Body        $body `
+            -ErrorAction Stop
+        return $resp.access_token
+    }
+
     function Update-Job {
         param(
             [string] $Status,
@@ -73,14 +97,11 @@ $MaesterRunnerScriptBlock = {
         Import-Module -Name Pester                         -ErrorAction Stop
         Import-Module -Name Maester                        -ErrorAction Stop
 
-        # Phase 3 modules — import conditionally
-        $needsExchange = $ExchangeToken -or ($MaesterClientId -and $MaesterClientSecret -and $TenantId)
-        $needsTeams    = $TeamsToken    -or ($MaesterClientId -and $MaesterClientSecret -and $TenantId)
-        if ($needsExchange) {
+        # App-reg service modules — import conditionally based on credentials being present
+        if ($MaesterClientId -and $MaesterClientSecret -and $TenantId) {
             Import-Module -Name ExchangeOnlineManagement   -ErrorAction Stop
-        }
-        if ($needsTeams) {
             Import-Module -Name MicrosoftTeams             -ErrorAction Stop
+            Import-Module -Name Az.Accounts                -ErrorAction Stop
         }
 
         # ── 2. Create isolated temp directory for this run ────────────────────
@@ -88,42 +109,22 @@ $MaesterRunnerScriptBlock = {
         $null = New-Item -ItemType Directory -Path $invocationTempDir -Force
 
         # ── 3. Connect to Microsoft Graph (REQUIRED) ─────────────────────────
-        # Path A — app-credential path: acquire a new Graph token via
-        # client_credentials so *all* tests run under the app registration's
-        # application permissions instead of the delegated (user) token.
-        # Path B — delegated path: use the $GraphToken forwarded by the caller.
+        # Primary path: use the MSAL workspace $GraphToken forwarded by the
+        # caller via Authorization: Bearer header.
+        # Fallback: acquire a Graph app-only token via client_credentials when
+        # app-reg credentials are supplied and no MSAL token is available.
         $graphTokenToUse = $GraphToken
-        if ($MaesterClientId -and $MaesterClientSecret -and $TenantId) {
-            try {
-                $graphCcBody = @{
-                    grant_type    = 'client_credentials'
-                    client_id     = $MaesterClientId
-                    client_secret = $MaesterClientSecret
-                    scope         = 'https://graph.microsoft.com/.default'
-                }
-                $graphCcResp = Invoke-RestMethod `
-                    -Uri         "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-                    -Method      Post `
-                    -Body        $graphCcBody `
-                    -ContentType 'application/x-www-form-urlencoded' `
-                    -ErrorAction Stop
-                $graphTokenToUse = $graphCcResp.access_token
-                Write-Host '[maester-runner] Graph token acquired via client_credentials (app reg path).'
-            }
-            catch {
-                # On the app-reg path there is no delegated GraphToken to fall back to.
-                # Re-throw immediately instead of attempting ConvertTo-SecureString on ''.
-                if (-not $GraphToken) {
-                    throw "client_credentials Graph token acquisition failed (no delegated fallback available): $($_.Exception.Message)"
-                }
-                Write-Warning "[maester-runner] client_credentials Graph token failed: $($_.Exception.Message). Falling back to delegated token."
-                $graphTokenToUse = $GraphToken
-            }
+        if (-not $graphTokenToUse -and $MaesterClientId -and $MaesterClientSecret -and $TenantId) {
+            Write-Host '[maester-runner] No MSAL Graph token supplied — acquiring via client_credentials.'
+            $graphTokenToUse = Get-ClientCredentialToken `
+                -TenantId     $TenantId `
+                -ClientId     $MaesterClientId `
+                -ClientSecret $MaesterClientSecret `
+                -Scope        'https://graph.microsoft.com/.default'
         }
 
-        # Guard against an empty token (e.g. TenantId was not forwarded by the caller).
         if (-not $graphTokenToUse) {
-            throw "No Graph token available. Ensure tenantId is included in the request body when using the app-reg path, or provide an Authorization: Bearer token on the delegated path."
+            throw 'No Graph token available. Provide Authorization: Bearer <token> or app-registration credentials (X-Maester-Client-Id / X-Maester-Client-Secret).'
         }
 
         $secureToken = ConvertTo-SecureString -String $graphTokenToUse -AsPlainText -Force
@@ -135,92 +136,210 @@ $MaesterRunnerScriptBlock = {
             Pop-Location
         }
 
-        # ── 3a. Connect to Exchange Online (Phase 3 — OPTIONAL) ──────────────
-        # Two paths:
-        #   A) App-credential path: acquire token via client_credentials flow
-        #      (no delegated Exchange token needed — uses Exchange.ManageAsApp).
-        #   B) Delegated path: caller pre-acquired an ExchangeToken.
-        $exchangeConnected = $false
-        if ($MaesterClientId -and $MaesterClientSecret -and $TenantId) {
-            # Path A — client_credentials
+        # ── 3.1 Resolve tenant domain name ────────────────────────────────
+        # Connect-IPPSSession's -Organization parameter requires the tenant's
+        # initial verified domain (e.g. contoso.onmicrosoft.com), NOT a GUID.
+        # Passing a GUID causes the SCC endpoint to return HTML error pages
+        # instead of JSON → "Unexpected character encountered while parsing
+        # value: <".  Exchange Online tolerates GUIDs, so this is only needed
+        # for IPPS.
+        $tenantDomain = $null
+        if ($graphTokenToUse -and $TenantId) {
             try {
-                $tokenBody = @{
-                    grant_type    = 'client_credentials'
-                    client_id     = $MaesterClientId
-                    client_secret = $MaesterClientSecret
-                    scope         = 'https://outlook.office365.com/.default'
-                }
-                $tokenResp = Invoke-RestMethod `
-                    -Uri    "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-                    -Method Post `
-                    -Body   $tokenBody `
-                    -ContentType 'application/x-www-form-urlencoded' `
+                $orgResp = Invoke-RestMethod `
+                    -Uri         'https://graph.microsoft.com/v1.0/organization?$select=verifiedDomains' `
+                    -Headers     @{ 'Authorization' = "Bearer $graphTokenToUse" } `
                     -ErrorAction Stop
+                # Find the initial *.onmicrosoft.com domain
+                $tenantDomain = ($orgResp.value[0].verifiedDomains |
+                    Where-Object { $_.isInitial -eq $true } |
+                    Select-Object -First 1).name
+                if ($tenantDomain) {
+                    Write-Host "[maester-runner] Resolved tenant domain: $tenantDomain"
+                }
+                else {
+                    Write-Warning 'Tenant domain resolution returned no initial domain — IPPS may fail.'
+                }
+            }
+            catch {
+                Write-Warning "Failed to resolve tenant domain: $($_.Exception.Message)"
+            }
+        }
 
-                $exoToken = ConvertTo-SecureString $tokenResp.access_token -AsPlainText -Force
+        # ── 3a. Connect to Exchange Online (OPTIONAL — app-only) ────────────
+        # Uses client_credentials grant to obtain an app-only EXO token.
+        # IMPORTANT: EXO module v3.9+ changed -AccessToken from SecureString
+        # to plain String.  Passing a SecureString causes PowerShell to
+        # bind the literal text "System.Security.SecureString" → 401.
+        # Prerequisites (provisioned by PipePal):
+        #   • Exchange.ManageAsApp application permission (admin consent)
+        #   • Exchange Administrator Entra ID role assigned to the SP
+        #   Note: Role propagation can take 5–30 minutes after initial provisioning;
+        #   re-run the tests if this fails immediately after app creation.
+        $exchangeConnected = $false
+        $exchangeError     = $null
+        $exoTokenRaw       = $null
+        if ($MaesterClientId -and $MaesterClientSecret -and $TenantId) {
+            try {
+                $exoTokenRaw = Get-ClientCredentialToken `
+                    -TenantId     $TenantId `
+                    -ClientId     $MaesterClientId `
+                    -ClientSecret $MaesterClientSecret `
+                    -Scope        'https://outlook.office365.com/.default'
                 Connect-ExchangeOnline `
-                    -AccessToken  $exoToken `
+                    -AccessToken  $exoTokenRaw `
                     -Organization $TenantId `
                     -ShowBanner:$false `
                     -ErrorAction Stop
                 $exchangeConnected = $true
-                Write-Host '[maester-runner] Exchange Online connected via client_credentials.'
+                Write-Host "[maester-runner] Exchange Online connected via app-only token (org: $TenantId)."
             }
             catch {
-                # Exchange Online connection via client_credentials requires TWO things in the customer tenant:
-                #   1. API permission: Exchange Online > Application > Exchange.ManageAsApp
-                #      (granted via Entra admin centre > API permissions, NOT Graph)
-                #   2. Exchange Online RBAC role: 'View-Only Configuration' assigned to the
-                #      app's service principal in Exchange Admin Centre > Roles > Admin roles.
-                # Without both, Connect-ExchangeOnline will fail and ORCA tests will skip.
-                Write-Warning "Exchange Online (app-credentials) connection failed: $($_.Exception.Message). Ensure the service principal has Exchange.ManageAsApp permission AND the 'View-Only Configuration' Exchange RBAC role assigned."
-            }
-        } elseif ($ExchangeToken -and $TenantId) {
-            # Path B — delegated token (legacy)
-            try {
-                Connect-ExchangeOnline `
-                    -AccessToken      $ExchangeToken `
-                    -Organization     $TenantId `
-                    -ShowBanner:$false `
-                    -ErrorAction Stop
-                $exchangeConnected = $true
-            }
-            catch {
-                Write-Warning "Exchange Online connection failed: $($_.Exception.Message)"
+                $exchangeError = $_.Exception.Message
+                Write-Warning "Exchange Online connection failed: $exchangeError"
             }
         }
 
-        # ── 3b. Connect to Microsoft Teams (Phase 3 — OPTIONAL) ──────────────
-        # Two paths:
-        #   A) App-credential path: Connect-MicrosoftTeams with client secret.
-        #   B) Delegated path: AccessTokens array (Graph + Teams tokens).
-        $teamsConnected = $false
-        if ($MaesterClientId -and $MaesterClientSecret -and $TenantId) {
-            # Path A — client_credentials via Connect-MicrosoftTeams
+        # ── 3a2. Connect to Security & Compliance (IPPS Session — OPTIONAL) ──
+        # Security & Compliance tests require a SEPARATE Connect-IPPSSession call.
+        # IPPS shares the Exchange Online infrastructure — the SCC PowerShell
+        # endpoint accepts tokens scoped to https://outlook.office365.com.
+        # Re-using the EXO token avoids needing a separate resource grant on
+        # the compliance audience (which the app registration may not have).
+        # See: https://learn.microsoft.com/en-us/powershell/exchange/app-only-auth-powershell-v2
+        $securityComplianceConnected = $false
+        $securityComplianceError     = $null
+        # IPPS requires the tenant domain name, not a GUID, for -Organization.
+        $ippsOrg = if ($tenantDomain) { $tenantDomain } else { $TenantId }
+        if ($exoTokenRaw -and $TenantId) {
             try {
-                $secureSecret = ConvertTo-SecureString $MaesterClientSecret -AsPlainText -Force
-                Connect-MicrosoftTeams `
-                    -TenantId    $TenantId `
-                    -ClientId    $MaesterClientId `
-                    -ClientSecret $secureSecret `
+                Connect-IPPSSession `
+                    -AccessToken  $exoTokenRaw `
+                    -Organization $ippsOrg `
+                    -ShowBanner:$false `
                     -ErrorAction Stop
-                $teamsConnected = $true
-                Write-Host '[maester-runner] Microsoft Teams connected via client_credentials.'
+                $securityComplianceConnected = $true
+                Write-Host "[maester-runner] Security & Compliance (IPPS) connected via EXO token (org: $ippsOrg)."
             }
             catch {
-                Write-Warning "Microsoft Teams (app-credentials) connection failed: $($_.Exception.Message)"
-            }
-        } elseif ($TeamsToken -and $GraphToken) {
-            # Path B — delegated tokens (legacy)
-            try {
-                $tokens = @($GraphToken, $TeamsToken)
-                Connect-MicrosoftTeams -AccessTokens $tokens -ErrorAction Stop
-                $teamsConnected = $true
-            }
-            catch {
-                Write-Warning "Microsoft Teams connection failed: $($_.Exception.Message)"
+                $securityComplianceError = $_.Exception.Message
+                Write-Warning "Security & Compliance (IPPS) connection failed: $securityComplianceError"
             }
         }
+        elseif ($MaesterClientId -and $MaesterClientSecret -and $TenantId -and -not $exoTokenRaw) {
+            # EXO token wasn't acquired — try standalone with compliance audience
+            try {
+                $ippsTokenRaw = Get-ClientCredentialToken `
+                    -TenantId     $TenantId `
+                    -ClientId     $MaesterClientId `
+                    -ClientSecret $MaesterClientSecret `
+                    -Scope        'https://ps.compliance.protection.outlook.com/.default'
+                Connect-IPPSSession `
+                    -AccessToken  $ippsTokenRaw `
+                    -Organization $ippsOrg `
+                    -ShowBanner:$false `
+                    -ErrorAction Stop
+                $securityComplianceConnected = $true
+                Write-Host "[maester-runner] Security & Compliance (IPPS) connected via compliance token (org: $ippsOrg)."
+            }
+            catch {
+                $securityComplianceError = $_.Exception.Message
+                Write-Warning "Security & Compliance (IPPS) connection failed: $securityComplianceError"
+            }
+        }
+
+        # ── 3b. Connect to Microsoft Teams (OPTIONAL) ────────────────────────
+        # MicrosoftTeams module requires TWO access tokens for app-only auth:
+        #   1. Microsoft Graph token  (aud: https://graph.microsoft.com)
+        #   2. Teams resource token   (aud: 48ac35b8-9aa8-4d74-927d-1f4a14a0b239)
+        #
+        # Per Microsoft docs, NO API permissions should be configured on the
+        # "Skype and Teams Tenant Admin API" service principal. RBAC comes
+        # from the directory role (Teams Administrator) assigned to the app.
+        #
+        # References:
+        #   https://learn.microsoft.com/en-us/microsoftteams/teams-powershell-application-authentication
+        $teamsConnected = $false
+        $teamsError     = $null
+        if ($MaesterClientId -and $MaesterClientSecret -and $TenantId) {
+            try {
+                # Both tokens MUST be the same type (both app-only via
+                # client_credentials).  $graphTokenToUse may be a delegated
+                # (user) token forwarded by the caller, so we always acquire
+                # a fresh app-only Graph token for the Teams connection.
+                $teamsGraphToken = Get-ClientCredentialToken `
+                    -TenantId     $TenantId `
+                    -ClientId     $MaesterClientId `
+                    -ClientSecret $MaesterClientSecret `
+                    -Scope        'https://graph.microsoft.com/.default'
+
+                # Acquire Teams API resource token via client_credentials
+                $teamsTokenRaw = Get-ClientCredentialToken `
+                    -TenantId     $TenantId `
+                    -ClientId     $MaesterClientId `
+                    -ClientSecret $MaesterClientSecret `
+                    -Scope        '48ac35b8-9aa8-4d74-927d-1f4a14a0b239/.default'
+
+                if (-not $teamsGraphToken -or -not $teamsTokenRaw) {
+                    throw 'Failed to acquire Teams tokens (Graph + resource)'
+                }
+
+                # Pass BOTH app-only tokens: Graph (element 0) + Teams resource (element 1)
+                # Docs example omits -TenantId; module infers it from the tokens.
+                Connect-MicrosoftTeams `
+                    -AccessTokens @($teamsGraphToken, $teamsTokenRaw) `
+                    -ErrorAction Stop
+                $teamsConnected = $true
+                Write-Host '[maester-runner] Microsoft Teams connected via Graph + Teams resource tokens.'
+            }
+            catch {
+                $teamsError = $_.Exception.Message
+                Write-Warning "Microsoft Teams connection failed: $teamsError"
+            }
+        }
+
+        # ── 3c. Connect to Azure (OPTIONAL — service principal) ──────────────
+        # Enables Azure resource tests (CIS Azure, XSPM, etc.).
+        # Uses service principal credentials with the tenant ID.
+        # The app registration must have Reader role (or equivalent) on the
+        # Azure subscription / management group being tested.
+        $azureConnected = $false
+        $azureError     = $null
+        if ($MaesterClientId -and $MaesterClientSecret -and $TenantId) {
+            try {
+                $azureSecureSecret = ConvertTo-SecureString $MaesterClientSecret -AsPlainText -Force
+                $azureCred = New-Object System.Management.Automation.PSCredential(
+                    $MaesterClientId, $azureSecureSecret
+                )
+                Connect-AzAccount `
+                    -ServicePrincipal `
+                    -Credential $azureCred `
+                    -Tenant     $TenantId `
+                    -ErrorAction Stop | Out-Null
+                $azureConnected = $true
+                Write-Host '[maester-runner] Azure connected via service principal.'
+            }
+            catch {
+                $azureError = $_.Exception.Message
+                Write-Warning "Azure connection failed: $azureError"
+            }
+        }
+
+        # ── 3d. Collect connection diagnostics ──────────────────────────────
+        # Track which services connected so the frontend can display it.
+        $connectionDiagnostics = [ordered]@{
+            graph                   = $true  # Graph is required; we'd have thrown if it failed
+            exchangeOnline          = $exchangeConnected
+            exchangeError           = $exchangeError
+            securityCompliance      = $securityComplianceConnected
+            securityComplianceError = $securityComplianceError
+            teams                   = $teamsConnected
+            teamsError              = $teamsError
+            azure                   = $azureConnected
+            azureError              = $azureError
+            moeraDomain             = $tenantDomain
+        }
+        Write-Host "[maester-runner] Connection summary: Graph=OK, Exchange=$exchangeConnected, IPPS=$securityComplianceConnected, Teams=$teamsConnected, Azure=$azureConnected"
 
         # ── 4. Resolve the effective test path ───────────────────────────────
         #
@@ -341,8 +460,18 @@ $MaesterRunnerScriptBlock = {
         if ($exchangeConnected) {
             Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
         }
+        if ($securityComplianceConnected) {
+            # Disconnect-IPPSSession is not a real cmdlet; the EXO module manages
+            # the SCC connection alongside Exchange.  Disconnecting Exchange
+            # (above) also tears down the IPPS session, but we call the
+            # ExchangeOnline disconnect again just in case they were separate.
+            try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+        }
         if ($teamsConnected) {
             Disconnect-MicrosoftTeams -ErrorAction SilentlyContinue
+        }
+        if ($azureConnected) {
+            Disconnect-AzAccount -ErrorAction SilentlyContinue | Out-Null
         }
 
         # ── 8. Read results file ──────────────────────────────────────────────
@@ -367,10 +496,16 @@ $MaesterRunnerScriptBlock = {
                 if ($sevTag) { $severity = $sevTag -replace '^Severity:', '' }
             }
 
-            $testId = $test.Tag |
-                Where-Object { $_ -match '^[A-Z]+(\.[A-Z0-9]+)+$' } |
-                Select-Object -First 1
-            if (-not $testId) { $testId = $test.Name -replace '\s+', '-' }
+            # Use Id already computed by ConvertTo-MtMaesterResult (e.g. "MT.1001"),
+            # fall back to legacy tag-based extraction for edge cases.
+            if ($test.Id) {
+                $testId = $test.Id
+            } else {
+                $testId = $test.Tag |
+                    Where-Object { $_ -match '^[A-Z]+(\.[A-Z0-9]+)+$' } |
+                    Select-Object -First 1
+                if (-not $testId) { $testId = $test.Name -replace '\s+', '-' }
+            }
 
             $flatTests += [ordered]@{
                 id          = $testId
@@ -384,6 +519,18 @@ $MaesterRunnerScriptBlock = {
                 category    = if ($test.Block) { ($test.Block -split '[.\s]' | Select-Object -First 1).Trim() } else { '' }
                 block       = if ($test.Block) { $test.Block } else { '' }
                 errorRecord = if ($test.ErrorRecord) { [string]$test.ErrorRecord } else { $null }
+                helpUrl     = if ($test.HelpUrl)     { [string]$test.HelpUrl }     else { $null }
+                # Rich detail from Add-MtTestResultDetail (description, result markdown, skip context)
+                resultDetail = if ($test.ResultDetail) {
+                    [ordered]@{
+                        description    = if ($test.ResultDetail.TestDescription) { [string]$test.ResultDetail.TestDescription } else { $null }
+                        resultMarkdown = if ($test.ResultDetail.TestResult)      { [string]$test.ResultDetail.TestResult }      else { $null }
+                        skippedBecause = if ($test.ResultDetail.TestSkipped)     { [string]$test.ResultDetail.TestSkipped }     else { $null }
+                        skippedReason  = if ($test.ResultDetail.SkippedReason)   { [string]$test.ResultDetail.SkippedReason }   else { $null }
+                        investigate    = if ($test.ResultDetail.TestInvestigate) { [bool]$test.ResultDetail.TestInvestigate }   else { $false }
+                        service        = if ($test.ResultDetail.Service)         { [string]$test.ResultDetail.Service }         else { $null }
+                    }
+                } else { $null }
             }
         }
 
@@ -409,6 +556,8 @@ $MaesterRunnerScriptBlock = {
                              else { $runStart.ToString('o') }
             suitesRun      = $Suites
             severityFilter = $Severities
+            # Connection diagnostics — tells the UI which services connected
+            connections    = $connectionDiagnostics
             tests          = $flatTests
         }
 
@@ -419,9 +568,10 @@ $MaesterRunnerScriptBlock = {
 
     }
     catch {
-        Disconnect-MgGraph -ErrorAction SilentlyContinue
-        Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
-        Disconnect-MicrosoftTeams -ErrorAction SilentlyContinue
+        Disconnect-MgGraph          -ErrorAction SilentlyContinue
+        Disconnect-ExchangeOnline   -Confirm:$false -ErrorAction SilentlyContinue
+        Disconnect-MicrosoftTeams   -ErrorAction SilentlyContinue
+        try { Disconnect-AzAccount  -ErrorAction SilentlyContinue | Out-Null } catch { }
         $errMsg = $_.Exception.Message
         try { Update-Job -Status 'failed' -Result $null -ErrorMsg $errMsg -DurationMs 0 } catch { }
     }
