@@ -92,15 +92,5 @@ stages:
                 az functionapp config container set \
                   --name $(functionAppName) \
                   --resource-group prd-rg-webservices \
-                  --image $(acrLoginServer)/$(imageName):latest \
+                  --image $(acrLoginServer)/$(imageName):$(imageTag) \
                   --registry-server https://$(acrLoginServer)
-
-                # Tell Azure to use managed identity instead of admin credentials
-                az functionapp config appsettings set \
-                  --name $(functionAppName) \
-                  --resource-group prd-rg-webservices \
-                  --settings \
-                    acrUseManagedIdentityCreds=true \
-                    WEBSITES_PORT=80 \
-                    DOCKER_ENABLE_CI=true \
-                    FUNCTIONS_WORKER_RUNTIME=custom
