@@ -78,6 +78,6 @@ stages:
                     inlineScript: |
                       az functionapp config container set \
                         --name $(functionAppName) \
-                        --resource-group $(az functionapp show --name $(functionAppName) --query resourceGroup -o tsv) \
+                        --resource-group prd-rg-webservices \
                         --image $(acrLoginServer)/$(imageName):$(imageTag) \
                         --registry-server https://$(acrLoginServer)
