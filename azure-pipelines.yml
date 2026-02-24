@@ -80,9 +80,27 @@ stages:
                     --yes
                 done
                 
-          - task: AzureFunctionAppContainer@1
-            displayName: "Update Function App Container"
+          - task: AzureCLI@2
+            displayName: 'Deploy container to Function App (managed identity)'
             inputs:
               azureSubscription: $(azureSubscription)
-              appName: $(functionAppName)
-              imageName: $(acrLoginServer)/$(imageName):$(imageTag)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # Use system-assigned managed identity for ACR pull auth.
+                # Requires the Function App's managed identity to have AcrPull on the ACR.
+                az functionapp config container set \
+                  --name $(functionAppName) \
+                  --resource-group prd-rg-webservices \
+                  --image $(acrLoginServer)/$(imageName):$(imageTag) \
+                  --registry-server https://$(acrLoginServer)
+
+                # Tell Azure to use managed identity instead of admin credentials
+                az functionapp config appsettings set \
+                  --name $(functionAppName) \
+                  --resource-group prd-rg-webservices \
+                  --settings \
+                    acrUseManagedIdentityCreds=true \
+                    WEBSITES_PORT=8080 \
+                    DOCKER_ENABLE_CI=true \
+                    FUNCTIONS_WORKER_RUNTIME=custom
