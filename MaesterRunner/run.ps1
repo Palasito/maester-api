@@ -2,12 +2,12 @@
 # Async job pattern:  POST starts a background job → returns jobId immediately.
 #                     GET polls job status → returns results when done.
 #
-# POST /api/MaesterRunner
+# POST /api/maester
 #   Body: { suites, severity?, tags?, includeLongRunning?, includePreview? }
 #   Auth: Authorization: Bearer <token>
 #   Response (202): { jobId, status: "running", createdAt }
 #
-# GET /api/MaesterRunner?jobId=<id>
+# GET /api/maester?jobId=<id>
 #   Response (200): { jobId, status, createdAt, updatedAt, result?, error? }
 #
 # Job state is persisted as JSON files under /home/maester-jobs/ so it survives

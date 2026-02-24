@@ -5,7 +5,7 @@
 #
 # API contract:
 #
-#   POST /api/MaesterRunner
+#   POST /api/maester
 #     Authorization: Bearer <graphToken>    (device code delegated token)
 #     X-Exchange-Token: <token>             (optional, for Exchange Online tests)
 #     X-Teams-Token: <token>                (optional, for Microsoft Teams tests)
@@ -15,7 +15,7 @@
 #             tenantId?, includeExchange?, includeTeams? }
 #     Response 202: { jobId, status: "running", createdAt }
 #
-#   GET  /api/MaesterRunner?jobId=<id>
+#   GET  /api/maester?jobId=<id>
 #     X-Functions-Key: <apiKey>
 #     Response 200: { jobId, status, createdAt, updatedAt, result?, error? }
 #
@@ -165,9 +165,9 @@ Start-PodeServer -Threads 1 {
     }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # GET /api/MaesterRunner — Poll job status
+    # GET /api/maester — Poll job status
     # ══════════════════════════════════════════════════════════════════════════
-    Add-PodeRoute -Method Get -Path '/api/MaesterRunner' -ScriptBlock {
+    Add-PodeRoute -Method Get -Path '/api/maester' -ScriptBlock {
         $dbPath       = $using:DB_PATH
         $staleMinutes = $using:JOB_STALE_MINUTES
 
@@ -253,9 +253,9 @@ Start-PodeServer -Threads 1 {
     }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # POST /api/MaesterRunner — Start a new Maester test run
+    # POST /api/maester — Start a new Maester test run
     # ══════════════════════════════════════════════════════════════════════════
-    Add-PodeRoute -Method Post -Path '/api/MaesterRunner' -ScriptBlock {
+    Add-PodeRoute -Method Post -Path '/api/maester' -ScriptBlock {
         $dbPath           = $using:DB_PATH
         $maxConcurrent    = $using:MAX_CONCURRENT_JOBS
         $runnerScriptBlock = $using:MaesterRunnerScriptBlock
