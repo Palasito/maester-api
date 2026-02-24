@@ -9,7 +9,7 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "7071:80"
+      - "7071:8080"
     environment:
       # API key for proxy authentication (matches PipePal's x-functions-key)
       - MAESTER_API_KEY=${MAESTER_API_KEY:-local-dev-key}
