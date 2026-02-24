@@ -9,7 +9,7 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "7071:8080"
+      - "7071:80"
     environment:
       # API key for proxy authentication (matches PipePal's x-functions-key)
       - MAESTER_API_KEY=${MAESTER_API_KEY:-local-dev-key}
@@ -21,7 +21,7 @@ services:
     healthcheck:
       # Use native wget instead of pwsh to avoid spawning a full PowerShell
       # process (~80-100 MB) every 30 seconds for health checks.
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/health"]
       interval: 30s
       timeout: 10s
       retries: 5

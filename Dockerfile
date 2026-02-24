@@ -32,6 +32,6 @@ WORKDIR /app
 COPY server.ps1 /app/server.ps1
 COPY lib/       /app/lib/
 
-EXPOSE 8080
+EXPOSE 80
 
 CMD ["pwsh", "-NoProfile", "-NonInteractive", "-File", "/app/server.ps1"]

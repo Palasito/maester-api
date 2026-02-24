@@ -106,7 +106,7 @@ Write-Host '[server] Starting Pode server on port 80...'
 
 Start-PodeServer -Threads 1 {
 
-    Add-PodeEndpoint -Address * -Port 8080 -Protocol Http
+    Add-PodeEndpoint -Address * -Port 80 -Protocol Http
 
     # ══════════════════════════════════════════════════════════════════════════
     # Middleware: API key validation on /api/* routes
