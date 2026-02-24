@@ -20,7 +20,7 @@ trigger:
 pr: none   # Don't trigger on PRs — only build on merge to main
 
 variables:
-  azureSubscription: 'AzureServiceConnection'   # Name of your Azure DevOps service connection
+  azureSubscription: 'AcrServiceConnection'   # Name of your Azure DevOps service connection
   acrLoginServer: 'acrpalprod-b2dsfkb7a7brc6gf.azurecr.io'
   acrName: 'acrpalprod'
   imageName: 'maester-api'
