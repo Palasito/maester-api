@@ -86,3 +86,20 @@ stages:
               azureSubscription: $(azureSubscription)
               appName: $(functionAppName)
               imageName: $(acrLoginServer)/$(imageName):$(imageTag)
+
+          - task: AzureCLI@2
+            displayName: 'Set required App Settings'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # WEBSITES_PORT tells Azure's reverse proxy which port the container
+                # listens on. Without this the traffic never reaches Pode and the app
+                # returns ":( Application Error" to every request.
+                az functionapp config appsettings set \
+                  --name $(functionAppName) \
+                  --resource-group prd-rg-webservices \
+                  --settings \
+                    WEBSITES_PORT=80 \
+                    DOCKER_ENABLE_CI=true
