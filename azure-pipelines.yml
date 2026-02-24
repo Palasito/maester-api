@@ -80,26 +80,37 @@ stages:
                     --yes
                 done
                 
-          - task: AzureFunctionAppContainer@1
-            displayName: "Update Function App Container"
-            inputs:
-              azureSubscription: $(azureSubscription)
-              appName: $(functionAppName)
-              imageName: $(acrLoginServer)/$(imageName):$(imageTag)
-
           - task: AzureCLI@2
-            displayName: 'Set required App Settings'
+            displayName: 'Deploy container to Function App'
             inputs:
               azureSubscription: $(azureSubscription)
               scriptType: 'bash'
               scriptLocation: 'inlineScript'
               inlineScript: |
-                # WEBSITES_PORT tells Azure's reverse proxy which port the container
-                # listens on. Without this the traffic never reaches Pode and the app
-                # returns ":( Application Error" to every request.
+                # Fetch ACR credentials explicitly (avoids the auto-lookup bug)
+                ACR_USERNAME=$(az acr credential show --name $(acrName) --query username -o tsv)
+                ACR_PASSWORD=$(az acr credential show --name $(acrName) --query "passwords[0].value" -o tsv)
+
+                # Set the container image + registry credentials
+                az functionapp config container set \
+                  --name $(functionAppName) \
+                  --resource-group prd-rg-webservices \
+                  --image $(acrLoginServer)/$(imageName):$(imageTag) \
+                  --registry-server https://$(acrLoginServer) \
+                  --registry-username $ACR_USERNAME \
+                  --registry-password $ACR_PASSWORD
+
+                # Set runtime to 'custom' (required for non-standard containers)
+                # and ensure WEBSITES_PORT matches the Pode server port (80)
+                az functionapp config set \
+                  --name $(functionAppName) \
+                  --resource-group prd-rg-webservices \
+                  --linux-fx-version "DOCKER|$(acrLoginServer)/$(imageName):$(imageTag)"
+
                 az functionapp config appsettings set \
                   --name $(functionAppName) \
                   --resource-group prd-rg-webservices \
                   --settings \
                     WEBSITES_PORT=80 \
-                    DOCKER_ENABLE_CI=true
+                    DOCKER_ENABLE_CI=true \
+                    FUNCTIONS_WORKER_RUNTIME=custom
