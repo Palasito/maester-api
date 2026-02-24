@@ -41,25 +41,20 @@ stages:
           - checkout: self
 
           - task: AzureCLI@2
-            displayName: 'Login to ACR'
+            displayName: 'Build and push image to ACR'
             inputs:
               azureSubscription: $(azureSubscription)
               scriptType: 'bash'
               scriptLocation: 'inlineScript'
+              # az acr build uploads the context to ACR and builds+pushes in the
+              # cloud — no Docker daemon or Docker Registry service connection needed.
               inlineScript: |
-                az acr login --name $(acrName)
-
-          - task: Docker@2
-            displayName: 'Build and push image'
-            inputs:
-              containerRegistry: $(azureSubscription)
-              repository: $(imageName)
-              command: 'buildAndPush'
-              Dockerfile: './Dockerfile'
-              buildContext: '.'
-              tags: |
-                $(imageTag)
-                latest
+                az acr build \
+                  --registry $(acrName) \
+                  --image $(imageName):$(imageTag) \
+                  --image $(imageName):latest \
+                  --file ./Dockerfile \
+                  .
 
   # ── Stage 2: Deploy ────────────────────────────────────────────────────────
   - stage: Deploy
