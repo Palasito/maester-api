@@ -64,6 +64,7 @@ stages:
     jobs:
       - deployment: DeployToFunctionApp
         displayName: 'Deploy maester-api'
+        environment: 'production'
         strategy:
           runOnce:
             deploy:
