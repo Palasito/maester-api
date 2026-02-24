@@ -79,36 +79,10 @@ stages:
                     --image $(imageName):$TAG \
                     --yes
                 done
-
-  # ── Stage 2: Deploy ────────────────────────────────────────────────────────
-  - stage: Deploy
-    displayName: 'Deploy to Function App'
-    dependsOn: Build
-    condition: succeeded()
-    jobs:
-      - deployment: DeployToFunctionApp
-        displayName: 'Deploy maester-api'
-        environment: 'production'
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - task: AzureCLI@2
-                  displayName: 'Update Function App container image'
-                  inputs:
-                    azureSubscription: $(azureSubscription)
-                    scriptType: 'bash'
-                    scriptLocation: 'inlineScript'
-                    inlineScript: |
-                      # Explicitly fetch ACR credentials to avoid the auto-lookup bug
-                      # where az searches by login server name instead of registry name.
-                      ACR_USERNAME=$(az acr credential show --name $(acrName) --query username -o tsv)
-                      ACR_PASSWORD=$(az acr credential show --name $(acrName) --query "passwords[0].value" -o tsv)
-
-                      az functionapp config container set \
-                        --name $(functionAppName) \
-                        --resource-group prd-rg-webservices \
-                        --image $(acrLoginServer)/$(imageName):$(imageTag) \
-                        --registry-server https://$(acrLoginServer) \
-                        --registry-username $ACR_USERNAME \
-                        --registry-password $ACR_PASSWORD
+                
+          - task: AzureFunctionAppContainer@1
+            displayName: "Update Function App Container"
+            inputs:
+              azureSubscription: $(AcrServiceConnection)
+              appName: $(functionAppName)
+              imageName: $(containerRegistry)/$(imageName):$(imageTag)
