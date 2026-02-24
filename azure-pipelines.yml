@@ -83,6 +83,6 @@ stages:
           - task: AzureFunctionAppContainer@1
             displayName: "Update Function App Container"
             inputs:
-              azureSubscription: $(AcrServiceConnection)
+              azureSubscription: $(azureSubscription)
               appName: $(functionAppName)
               imageName: $(containerRegistry)/$(imageName):$(imageTag)
