@@ -56,6 +56,30 @@ stages:
                   --file ./Dockerfile \
                   .
 
+          - task: AzureCLI@2
+            displayName: 'Purge old ACR images (keep latest 2)'
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                # List all tags sorted by creation time (oldest first), exclude 'latest'.
+                # Keep the 2 most recent SHA tags; delete everything older.
+                TAGS=$(az acr repository show-tags \
+                  --name $(acrName) \
+                  --repository $(imageName) \
+                  --orderby time_desc \
+                  --output tsv | grep -v '^latest$')
+
+                # Skip the first 2 (most recent), delete the rest
+                echo "$TAGS" | tail -n +3 | while read -r TAG; do
+                  echo "Deleting old tag: $(acrLoginServer)/$(imageName):$TAG"
+                  az acr repository delete \
+                    --name $(acrName) \
+                    --image $(imageName):$TAG \
+                    --yes
+                done
+
   # ── Stage 2: Deploy ────────────────────────────────────────────────────────
   - stage: Deploy
     displayName: 'Deploy to Function App'
