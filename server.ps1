@@ -328,13 +328,16 @@ Start-PodeServer -Threads 1 {
         .footer { text-align: center; margin-top: 2rem; font-size: 0.75rem; color: #484f58; }
         .footer a { color: #58a6ff; text-decoration: none; }
         .footer a:hover { text-decoration: underline; }
+        .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #3fb950; margin-right: 5px; animation: pulse 2s infinite; vertical-align: middle; }
+        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+        #last-updated { color: #484f58; font-size: 0.72rem; }
     </style>
 </head>
 <body>
 <div class="dashboard">
     <div class="header">
         <h1>&#x1F6E1; Maester API</h1>
-        <p>Health Dashboard</p>
+        <p>Health Dashboard &middot; <span class="live-dot"></span><span style="color:#3fb950;font-size:0.8rem">Live</span></p>
     </div>
 
     <div class="section-title">Server Status</div>
@@ -345,7 +348,7 @@ Start-PodeServer -Threads 1 {
         </div>
         <div class="card">
             <div class="label">Uptime</div>
-            <div class="value">$uptimeStr</div>
+            <div class="value" id="uptime-val">$uptimeStr</div>
         </div>
         <div class="card">
             <div class="label">Database</div>
@@ -353,7 +356,7 @@ Start-PodeServer -Threads 1 {
         </div>
         <div class="card">
             <div class="label">Active Jobs</div>
-            <div class="value $(if ($activeJobs -gt 0) { 'status-warn' } else { '' })">$activeJobs</div>
+            <div class="value $(if ($activeJobs -gt 0) { 'status-warn' } else { '' })" id="active-jobs-val">$activeJobs</div>
         </div>
     </div>
 
@@ -396,35 +399,74 @@ Start-PodeServer -Threads 1 {
     <div class="grid">
         <div class="card">
             <div class="label">CPU Current</div>
-            <div class="value $cpuColor">$($res.cpuPercent)%</div>
+            <div class="value $cpuColor" id="cpu-current-val">$($res.cpuPercent)%</div>
             <div class="bar-container">
-                <div class="bar-fill $cpuBar" style="width: $($res.cpuPercent)%"></div>
+                <div class="bar-fill $cpuBar" id="cpu-current-bar" style="width: $($res.cpuPercent)%"></div>
             </div>
         </div>
         <div class="card">
             <div class="label">CPU Average</div>
-            <div class="value">$($res.cpuAvgPercent)%</div>
+            <div class="value" id="cpu-avg-val">$($res.cpuAvgPercent)%</div>
             <div class="sub">Rolling 1-hour window</div>
         </div>
         <div class="card">
             <div class="label">RAM Used</div>
-            <div class="value $ramColor">$($res.ramUsedMB) MB</div>
-            <div class="sub">$ramOfStr</div>
+            <div class="value $ramColor" id="ram-used-val">$($res.ramUsedMB) MB</div>
+            <div class="sub" id="ram-used-sub">$ramOfStr</div>
             <div class="bar-container">
-                <div class="bar-fill $ramBar" style="width: ${ramPercent}%"></div>
+                <div class="bar-fill $ramBar" id="ram-used-bar" style="width: ${ramPercent}%"></div>
             </div>
         </div>
         <div class="card">
             <div class="label">RAM Average</div>
-            <div class="value">$($res.ramAvgMB) MB</div>
-            <div class="sub">$ramAvgSub</div>
+            <div class="value" id="ram-avg-val">$($res.ramAvgMB) MB</div>
+            <div class="sub" id="ram-avg-sub">$ramAvgSub</div>
         </div>
     </div>
 
     <div class="footer">
-        <a href="/health">/health</a> (JSON) &middot; Maester API v1.0
+        <a href="/health">/health</a> (JSON) &middot; Maester API v1.0 &middot; <span id="last-updated">Connecting&hellip;</span>
     </div>
 </div>
+<script>
+function statusCls(p, w, e) { return p >= e ? 'status-error' : p >= w ? 'status-warn' : 'status-ok'; }
+function barCls(p, w, e) { return 'bar-fill ' + (p >= e ? 'bar-red' : p >= w ? 'bar-yellow' : 'bar-green'); }
+function el(id) { return document.getElementById(id); }
+function setText(id, t) { var e = el(id); if (e) e.textContent = t; }
+function setHtml(id, h) { var e = el(id); if (e) e.innerHTML = h; }
+function setBar(id, cls, pct) { var e = el(id); if (e) { e.className = cls; e.style.width = pct + '%'; } }
+function setValueCls(id, cls) {
+    var e = el(id); if (!e) return;
+    e.className = e.className.replace(/status-\w+/g, '').trim();
+    if (cls) e.className += ' ' + cls;
+}
+function fmtUptime(s) {
+    return Math.floor(s/86400)+'d '+Math.floor((s%86400)/3600)+'h '+Math.floor((s%3600)/60)+'m '+(s%60)+'s';
+}
+function poll() {
+    fetch('/health').then(function(r) { return r.json(); }).then(function(d) {
+        setText('uptime-val', fmtUptime(d.uptime));
+        setText('active-jobs-val', d.activeJobs);
+        setValueCls('active-jobs-val', d.activeJobs > 0 ? 'status-warn' : '');
+
+        setText('cpu-current-val', d.cpuPercent + '%');
+        setValueCls('cpu-current-val', statusCls(d.cpuPercent, 50, 80));
+        setBar('cpu-current-bar', barCls(d.cpuPercent, 50, 80), d.cpuPercent);
+        setText('cpu-avg-val', d.cpuAvgPercent + '%');
+
+        setText('ram-used-val', d.ramUsedMB + ' MB');
+        setValueCls('ram-used-val', statusCls(d.ramPercent, 60, 85));
+        setBar('ram-used-bar', barCls(d.ramPercent, 60, 85), d.ramPercent);
+        setHtml('ram-used-sub', d.ramTotalMB > 0 ? ('of ' + d.ramTotalMB + ' MB (' + d.ramPercent + '%)') : '(no limit set)');
+        setText('ram-avg-val', d.ramAvgMB + ' MB');
+        setHtml('ram-avg-sub', d.ramTotalMB > 0 ? (d.ramAvgPercent + '% &middot; Rolling 1-hour') : 'Rolling 1-hour window');
+
+        setText('last-updated', 'Updated ' + new Date().toLocaleTimeString());
+    }).catch(function() { setText('last-updated', 'Poll failed — retrying…'); });
+}
+poll();
+setInterval(poll, 1000);
+</script>
 </body>
 </html>
 "@
