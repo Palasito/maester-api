@@ -109,6 +109,80 @@ Start-PodeServer -Threads 1 {
     Add-PodeEndpoint -Address * -Port 80 -Protocol Http
 
     # ══════════════════════════════════════════════════════════════════════════
+    # Resource monitoring: CPU + RAM sampling every 30 seconds
+    # ══════════════════════════════════════════════════════════════════════════
+    # Seed initial /proc/stat reading so the first timer tick can compute a delta.
+    $initCpuIdle  = [long]0
+    $initCpuTotal = [long]1   # avoid div-by-zero
+    try {
+        $cpuLine   = (Get-Content /proc/stat -TotalCount 1) -replace '^cpu\s+', ''
+        $cpuFields = $cpuLine -split '\s+' | ForEach-Object { [long]$_ }
+        $initCpuIdle  = [long]$cpuFields[3] + [long]$cpuFields[4]   # idle + iowait
+        $initCpuTotal = ($cpuFields | Measure-Object -Sum).Sum
+    } catch { }
+
+    Set-PodeState -Name 'ResourceMonitor' -Value @{
+        Samples      = [System.Collections.ArrayList]::new()
+        LastCpuIdle  = $initCpuIdle
+        LastCpuTotal = $initCpuTotal
+    }
+
+    Add-PodeTimer -Name 'ResourceSampler' -Interval 30 -ScriptBlock {
+        try {
+            # ── CPU from /proc/stat ──────────────────────────────────────
+            $cpuLine = (Get-Content /proc/stat -TotalCount 1) -replace '^cpu\s+', ''
+            $fields  = $cpuLine -split '\s+' | ForEach-Object { [long]$_ }
+            $idle    = [long]$fields[3] + [long]$fields[4]
+            $total   = ($fields | Measure-Object -Sum).Sum
+
+            # ── RAM from cgroup (v2 → v1 → /proc/meminfo fallback) ──────
+            $ramUsedMB = 0; $ramTotalMB = 0
+            if (Test-Path '/sys/fs/cgroup/memory.current') {
+                # cgroup v2
+                $ramUsedMB  = [math]::Round([long](Get-Content '/sys/fs/cgroup/memory.current') / 1MB, 1)
+                $maxRaw     = (Get-Content '/sys/fs/cgroup/memory.max').Trim()
+                $ramTotalMB = if ($maxRaw -eq 'max') { 0 } else { [math]::Round([long]$maxRaw / 1MB, 1) }
+            }
+            elseif (Test-Path '/sys/fs/cgroup/memory/memory.usage_in_bytes') {
+                # cgroup v1
+                $ramUsedMB  = [math]::Round([long](Get-Content '/sys/fs/cgroup/memory/memory.usage_in_bytes') / 1MB, 1)
+                $limitRaw   = (Get-Content '/sys/fs/cgroup/memory/memory.limit_in_bytes').Trim()
+                $ramTotalMB = if ([long]$limitRaw -gt 1TB) { 0 } else { [math]::Round([long]$limitRaw / 1MB, 1) }
+            }
+            else {
+                # Bare-metal / VM fallback via /proc/meminfo
+                $memInfo = Get-Content /proc/meminfo -ErrorAction SilentlyContinue
+                $totalKB = [long](($memInfo | Where-Object { $_ -match '^MemTotal:' }) -replace '\D+', '')
+                $availKB = [long](($memInfo | Where-Object { $_ -match '^MemAvailable:' }) -replace '\D+', '')
+                $ramTotalMB = [math]::Round($totalKB / 1024, 1)
+                $ramUsedMB  = [math]::Round(($totalKB - $availKB) / 1024, 1)
+            }
+
+            Lock-PodeObject -Name 'ResourceLock' -ScriptBlock {
+                $mon = Get-PodeState -Name 'ResourceMonitor'
+
+                $idleDelta  = $idle  - $mon.LastCpuIdle
+                $totalDelta = $total - $mon.LastCpuTotal
+                $cpuPercent = if ($totalDelta -gt 0) {
+                    [math]::Round((1 - ($idleDelta / $totalDelta)) * 100, 1)
+                } else { 0 }
+
+                $mon.LastCpuIdle  = $idle
+                $mon.LastCpuTotal = $total
+
+                $mon.Samples.Add([PSCustomObject]@{
+                    CpuPercent = [double]$cpuPercent
+                    RamUsedMB  = [double]$ramUsedMB
+                    RamTotalMB = [double]$ramTotalMB
+                }) | Out-Null
+
+                # Keep last 120 samples (1 hour at 30s intervals)
+                while ($mon.Samples.Count -gt 120) { $mon.Samples.RemoveAt(0) }
+            }
+        } catch { }
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
     # Middleware: API key validation on /api/* routes
     # ══════════════════════════════════════════════════════════════════════════
     Add-PodeMiddleware -Name 'ApiKeyAuth' -Route '/api/*' -ScriptBlock {
@@ -172,6 +246,44 @@ Start-PodeServer -Threads 1 {
         $minStr = Format-Duration $minMs
         $maxStr = Format-Duration $maxMs
 
+        # ── Resource metrics ──────────────────────────────────────────────────
+        $res = @{ cpuPercent = 0; cpuAvgPercent = 0; ramUsedMB = 0; ramTotalMB = 0; ramAvgMB = 0 }
+        try {
+            if (Test-Path '/sys/fs/cgroup/memory.current') {
+                $res.ramUsedMB  = [math]::Round([long](Get-Content '/sys/fs/cgroup/memory.current') / 1MB, 1)
+                $maxRaw         = (Get-Content '/sys/fs/cgroup/memory.max').Trim()
+                $res.ramTotalMB = if ($maxRaw -eq 'max') { 0 } else { [math]::Round([long]$maxRaw / 1MB, 1) }
+            }
+            elseif (Test-Path '/sys/fs/cgroup/memory/memory.usage_in_bytes') {
+                $res.ramUsedMB  = [math]::Round([long](Get-Content '/sys/fs/cgroup/memory/memory.usage_in_bytes') / 1MB, 1)
+                $limitRaw       = (Get-Content '/sys/fs/cgroup/memory/memory.limit_in_bytes').Trim()
+                $res.ramTotalMB = if ([long]$limitRaw -gt 1TB) { 0 } else { [math]::Round([long]$limitRaw / 1MB, 1) }
+            }
+            else {
+                $memInfo = Get-Content /proc/meminfo -ErrorAction SilentlyContinue
+                $totalKB = [long](($memInfo | Where-Object { $_ -match '^MemTotal:' }) -replace '\D+', '')
+                $availKB = [long](($memInfo | Where-Object { $_ -match '^MemAvailable:' }) -replace '\D+', '')
+                $res.ramTotalMB = [math]::Round($totalKB / 1024, 1)
+                $res.ramUsedMB  = [math]::Round(($totalKB - $availKB) / 1024, 1)
+            }
+            Lock-PodeObject -Name 'ResourceLock' -ScriptBlock {
+                $mon = Get-PodeState -Name 'ResourceMonitor'
+                if ($mon -and $mon.Samples.Count -gt 0) {
+                    $res.cpuPercent    = $mon.Samples[-1].CpuPercent
+                    $res.cpuAvgPercent = [math]::Round(($mon.Samples | Measure-Object -Property CpuPercent -Average).Average, 1)
+                    $res.ramAvgMB      = [math]::Round(($mon.Samples | Measure-Object -Property RamUsedMB  -Average).Average, 1)
+                }
+            }
+        } catch { }
+        $ramPercent    = if ($res.ramTotalMB -gt 0) { [math]::Round(($res.ramUsedMB / $res.ramTotalMB) * 100, 1) } else { 0 }
+        $ramAvgPercent = if ($res.ramTotalMB -gt 0) { [math]::Round(($res.ramAvgMB  / $res.ramTotalMB) * 100, 1) } else { 0 }
+        $cpuColor  = if ($res.cpuPercent -ge 80) { 'status-error' } elseif ($res.cpuPercent -ge 50) { 'status-warn' } else { 'status-ok' }
+        $cpuBar    = if ($res.cpuPercent -ge 80) { 'bar-red' }    elseif ($res.cpuPercent -ge 50) { 'bar-yellow' } else { 'bar-green' }
+        $ramColor  = if ($ramPercent -ge 85) { 'status-error' }    elseif ($ramPercent -ge 60) { 'status-warn' } else { 'status-ok' }
+        $ramBar    = if ($ramPercent -ge 85) { 'bar-red' }         elseif ($ramPercent -ge 60) { 'bar-yellow' } else { 'bar-green' }
+        $ramOfStr  = if ($res.ramTotalMB -gt 0) { "of $($res.ramTotalMB) MB (${ramPercent}%)" } else { '(no limit set)' }
+        $ramAvgSub = if ($res.ramTotalMB -gt 0) { "${ramAvgPercent}% &middot; Rolling 1-hour" } else { 'Rolling 1-hour window' }
+
         $html = @"
 <!DOCTYPE html>
 <html lang="en">
@@ -211,6 +323,7 @@ Start-PodeServer -Threads 1 {
         .bar-container { background: #21262d; border-radius: 4px; height: 8px; overflow: hidden; margin-top: 0.5rem; }
         .bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
         .bar-green  { background: #3fb950; }
+        .bar-yellow { background: #d29922; }
         .bar-red    { background: #f85149; }
         .footer { text-align: center; margin-top: 2rem; font-size: 0.75rem; color: #484f58; }
         .footer a { color: #58a6ff; text-decoration: none; }
@@ -279,6 +392,35 @@ Start-PodeServer -Threads 1 {
         </div>
     </div>
 
+    <div class="section-title">Resource Usage</div>
+    <div class="grid">
+        <div class="card">
+            <div class="label">CPU Current</div>
+            <div class="value $cpuColor">$($res.cpuPercent)%</div>
+            <div class="bar-container">
+                <div class="bar-fill $cpuBar" style="width: $($res.cpuPercent)%"></div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">CPU Average</div>
+            <div class="value">$($res.cpuAvgPercent)%</div>
+            <div class="sub">Rolling 1-hour window</div>
+        </div>
+        <div class="card">
+            <div class="label">RAM Used</div>
+            <div class="value $ramColor">$($res.ramUsedMB) MB</div>
+            <div class="sub">$ramOfStr</div>
+            <div class="bar-container">
+                <div class="bar-fill $ramBar" style="width: ${ramPercent}%"></div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">RAM Average</div>
+            <div class="value">$($res.ramAvgMB) MB</div>
+            <div class="sub">$ramAvgSub</div>
+        </div>
+    </div>
+
     <div class="footer">
         <a href="/health">/health</a> (JSON) &middot; Maester API v1.0
     </div>
@@ -311,18 +453,60 @@ Start-PodeServer -Threads 1 {
             $stats = Get-JobStats -DbPath $dbPath
         } catch { }
 
-        $uptimeSec = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
+        # ── Resource metrics (live RAM + averages from sampler) ───────────
+        $res = @{ cpuPercent = 0; cpuAvgPercent = 0; ramUsedMB = 0; ramTotalMB = 0; ramAvgMB = 0 }
+        try {
+            # Live RAM reading
+            if (Test-Path '/sys/fs/cgroup/memory.current') {
+                $res.ramUsedMB  = [math]::Round([long](Get-Content '/sys/fs/cgroup/memory.current') / 1MB, 1)
+                $maxRaw         = (Get-Content '/sys/fs/cgroup/memory.max').Trim()
+                $res.ramTotalMB = if ($maxRaw -eq 'max') { 0 } else { [math]::Round([long]$maxRaw / 1MB, 1) }
+            }
+            elseif (Test-Path '/sys/fs/cgroup/memory/memory.usage_in_bytes') {
+                $res.ramUsedMB  = [math]::Round([long](Get-Content '/sys/fs/cgroup/memory/memory.usage_in_bytes') / 1MB, 1)
+                $limitRaw       = (Get-Content '/sys/fs/cgroup/memory/memory.limit_in_bytes').Trim()
+                $res.ramTotalMB = if ([long]$limitRaw -gt 1TB) { 0 } else { [math]::Round([long]$limitRaw / 1MB, 1) }
+            }
+            else {
+                $memInfo = Get-Content /proc/meminfo -ErrorAction SilentlyContinue
+                $totalKB = [long](($memInfo | Where-Object { $_ -match '^MemTotal:' }) -replace '\D+', '')
+                $availKB = [long](($memInfo | Where-Object { $_ -match '^MemAvailable:' }) -replace '\D+', '')
+                $res.ramTotalMB = [math]::Round($totalKB / 1024, 1)
+                $res.ramUsedMB  = [math]::Round(($totalKB - $availKB) / 1024, 1)
+            }
+
+            # CPU current + averages from ResourceMonitor state
+            Lock-PodeObject -Name 'ResourceLock' -ScriptBlock {
+                $mon = Get-PodeState -Name 'ResourceMonitor'
+                if ($mon -and $mon.Samples.Count -gt 0) {
+                    $res.cpuPercent    = $mon.Samples[-1].CpuPercent
+                    $res.cpuAvgPercent = [math]::Round(($mon.Samples | Measure-Object -Property CpuPercent -Average).Average, 1)
+                    $res.ramAvgMB      = [math]::Round(($mon.Samples | Measure-Object -Property RamUsedMB  -Average).Average, 1)
+                }
+            }
+        } catch { }
+
+        $ramPercent    = if ($res.ramTotalMB -gt 0) { [math]::Round(($res.ramUsedMB / $res.ramTotalMB) * 100, 1) } else { 0 }
+        $ramAvgPercent = if ($res.ramTotalMB -gt 0) { [math]::Round(($res.ramAvgMB  / $res.ramTotalMB) * 100, 1) } else { 0 }
+        $uptimeSec     = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
 
         $response = [ordered]@{
-            status         = 'ok'
-            uptime         = $uptimeSec
-            dbConnected    = $dbOk
-            activeJobs     = $activeJobs
-            totalCompleted = if ($stats) { $stats.totalCompleted } else { 0 }
-            totalFailed    = if ($stats) { $stats.totalFailed }    else { 0 }
-            avgDurationMs  = if ($stats) { $stats.avgDurationMs }  else { 0 }
-            minDurationMs  = if ($stats) { $stats.minDurationMs }  else { 0 }
-            maxDurationMs  = if ($stats) { $stats.maxDurationMs }  else { 0 }
+            status          = 'ok'
+            uptime          = $uptimeSec
+            dbConnected     = $dbOk
+            activeJobs      = $activeJobs
+            cpuPercent      = $res.cpuPercent
+            cpuAvgPercent   = $res.cpuAvgPercent
+            ramUsedMB       = $res.ramUsedMB
+            ramTotalMB      = $res.ramTotalMB
+            ramPercent      = $ramPercent
+            ramAvgMB        = $res.ramAvgMB
+            ramAvgPercent   = $ramAvgPercent
+            totalCompleted  = if ($stats) { $stats.totalCompleted } else { 0 }
+            totalFailed     = if ($stats) { $stats.totalFailed }    else { 0 }
+            avgDurationMs   = if ($stats) { $stats.avgDurationMs }  else { 0 }
+            minDurationMs   = if ($stats) { $stats.minDurationMs }  else { 0 }
+            maxDurationMs   = if ($stats) { $stats.maxDurationMs }  else { 0 }
             lastCompletedAt = if ($stats) { $stats.lastCompletedAt } else { $null }
         }
 
