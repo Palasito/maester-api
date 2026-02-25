@@ -40,6 +40,18 @@ function Initialize-MaesterDb {
         # Column already exists — safe to ignore
     }
 
+    # Persistent statistics table — survives job deletion
+    Invoke-SqliteQuery -DataSource $DbPath -Query @"
+        CREATE TABLE IF NOT EXISTS job_stats (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id        TEXT    NOT NULL,
+            status        TEXT    NOT NULL,
+            duration_ms   INTEGER NOT NULL DEFAULT 0,
+            suites        TEXT,
+            completed_at  TEXT    NOT NULL
+        );
+"@
+
     # WAL mode: concurrent readers + single writer, non-blocking reads
     Invoke-SqliteQuery -DataSource $DbPath -Query 'PRAGMA journal_mode=WAL;'
     # Wait up to 5 s for a write lock instead of failing immediately
@@ -193,4 +205,64 @@ function Set-StaleJobsTimedOut {
         WHERE  status = 'running'
           AND  created_at < @cutoff
 "@ -SqlParameters @{ cutoff = $cutoff; now = $now }
+}
+
+# ── Stats / History ───────────────────────────────────────────────────────────
+
+function Record-JobCompletion {
+    <#
+    .SYNOPSIS  Persist a snapshot into job_stats when a job reaches terminal state.
+               Called before the job row is deleted, so historical stats survive cleanup.
+    #>
+    param(
+        [Parameter(Mandatory)][string] $DbPath,
+        [Parameter(Mandatory)][string] $JobId,
+        [Parameter(Mandatory)][string] $Status,
+        [int]    $DurationMs = 0,
+        [string] $Suites     = ''
+    )
+
+    $now = [datetime]::UtcNow.ToString('o')
+    Invoke-SqliteQuery -DataSource $DbPath -Query @"
+        INSERT INTO job_stats (job_id, status, duration_ms, suites, completed_at)
+        VALUES (@jobId, @status, @durationMs, @suites, @now)
+"@ -SqlParameters @{
+        jobId      = $JobId
+        status     = $Status
+        durationMs = $DurationMs
+        suites     = $Suites
+        now        = $now
+    }
+}
+
+function Get-JobStats {
+    <#
+    .SYNOPSIS  Aggregate statistics from the persistent job_stats table.
+    .OUTPUTS   [PSCustomObject] with totalCompleted, totalFailed, avgDurationMs,
+               minDurationMs, maxDurationMs, lastCompletedAt.
+    #>
+    param([Parameter(Mandatory)][string] $DbPath)
+
+    $row = Invoke-SqliteQuery -DataSource $DbPath -Query @"
+        SELECT
+            COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS totalCompleted,
+            COALESCE(SUM(CASE WHEN status = 'failed'    THEN 1 ELSE 0 END), 0) AS totalFailed,
+            COALESCE(AVG(CASE WHEN status = 'completed' AND duration_ms > 0
+                         THEN duration_ms END), 0)                              AS avgDurationMs,
+            COALESCE(MIN(CASE WHEN status = 'completed' AND duration_ms > 0
+                         THEN duration_ms END), 0)                              AS minDurationMs,
+            COALESCE(MAX(CASE WHEN status = 'completed' AND duration_ms > 0
+                         THEN duration_ms END), 0)                              AS maxDurationMs,
+            MAX(completed_at)                                                    AS lastCompletedAt
+        FROM job_stats
+"@
+
+    return [PSCustomObject]@{
+        totalCompleted = [int]$row.totalCompleted
+        totalFailed    = [int]$row.totalFailed
+        avgDurationMs  = [math]::Round([double]$row.avgDurationMs)
+        minDurationMs  = [int]$row.minDurationMs
+        maxDurationMs  = [int]$row.maxDurationMs
+        lastCompletedAt = if ($row.lastCompletedAt) { $row.lastCompletedAt } else { $null }
+    }
 }

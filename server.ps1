@@ -124,29 +124,209 @@ Start-PodeServer -Threads 1 {
     }
 
     # ══════════════════════════════════════════════════════════════════════════
+    # GET / — HTML stats dashboard (no auth)
+    # ══════════════════════════════════════════════════════════════════════════
+    Add-PodeRoute -Method Get -Path '/' -ScriptBlock {
+        $dbPath    = $using:DB_PATH
+        $startTime = $using:SERVER_START_TIME
+
+        # Re-source db helpers (Pode runspaces don't share parent scope)
+        . /app/lib/db.ps1
+
+        $dbOk       = $false
+        $activeJobs = 0
+        $stats      = $null
+        try {
+            Import-Module PSSQLite -ErrorAction SilentlyContinue
+            $row = Invoke-SqliteQuery -DataSource $dbPath -Query "SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'"
+            $activeJobs = [int]$row.cnt
+            $dbOk = $true
+            $stats = Get-JobStats -DbPath $dbPath
+        } catch { }
+
+        $uptimeSec    = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
+        $uptimeStr    = '{0}d {1}h {2}m {3}s' -f [math]::Floor($uptimeSec / 86400),
+                        [math]::Floor(($uptimeSec % 86400) / 3600),
+                        [math]::Floor(($uptimeSec % 3600) / 60),
+                        ($uptimeSec % 60)
+        $dbStatus     = if ($dbOk) { '&#x2705; Connected' } else { '&#x274C; Disconnected' }
+        $completed    = if ($stats) { $stats.totalCompleted } else { 0 }
+        $failed       = if ($stats) { $stats.totalFailed }    else { 0 }
+        $totalRuns    = $completed + $failed
+        $avgMs        = if ($stats) { $stats.avgDurationMs }  else { 0 }
+        $minMs        = if ($stats) { $stats.minDurationMs }  else { 0 }
+        $maxMs        = if ($stats) { $stats.maxDurationMs }  else { 0 }
+        $lastRun      = if ($stats -and $stats.lastCompletedAt) { $stats.lastCompletedAt } else { 'N/A' }
+        $successRate  = if ($totalRuns -gt 0) { [math]::Round(($completed / $totalRuns) * 100, 1) } else { 0 }
+
+        # Format durations as human-readable
+        function Format-Duration([int]$ms) {
+            if ($ms -le 0) { return 'N/A' }
+            $totalSec = [math]::Round($ms / 1000)
+            if ($totalSec -lt 60) { return "${totalSec}s" }
+            $m = [math]::Floor($totalSec / 60)
+            $s = $totalSec % 60
+            return "${m}m ${s}s"
+        }
+        $avgStr = Format-Duration $avgMs
+        $minStr = Format-Duration $minMs
+        $maxStr = Format-Duration $maxMs
+
+        $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Maester API — Health Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0d1117; color: #e6edf3; min-height: 100vh;
+            display: flex; align-items: center; justify-content: center;
+            padding: 2rem;
+        }
+        .dashboard { max-width: 720px; width: 100%; }
+        .header {
+            text-align: center; margin-bottom: 2rem;
+        }
+        .header h1 { font-size: 1.75rem; font-weight: 600; color: #58a6ff; }
+        .header p { color: #8b949e; margin-top: 0.25rem; font-size: 0.9rem; }
+        .grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem; margin-bottom: 1.5rem;
+        }
+        .card {
+            background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+            padding: 1.25rem;
+        }
+        .card .label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #8b949e; margin-bottom: 0.5rem; }
+        .card .value { font-size: 1.5rem; font-weight: 600; }
+        .card .sub   { font-size: 0.8rem; color: #8b949e; margin-top: 0.25rem; }
+        .status-ok    { color: #3fb950; }
+        .status-warn  { color: #d29922; }
+        .status-error { color: #f85149; }
+        .section-title { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: #8b949e; margin-bottom: 0.75rem; font-weight: 600; }
+        .bar-container { background: #21262d; border-radius: 4px; height: 8px; overflow: hidden; margin-top: 0.5rem; }
+        .bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+        .bar-green  { background: #3fb950; }
+        .bar-red    { background: #f85149; }
+        .footer { text-align: center; margin-top: 2rem; font-size: 0.75rem; color: #484f58; }
+        .footer a { color: #58a6ff; text-decoration: none; }
+        .footer a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+<div class="dashboard">
+    <div class="header">
+        <h1>&#x1F6E1; Maester API</h1>
+        <p>Health Dashboard</p>
+    </div>
+
+    <div class="section-title">Server Status</div>
+    <div class="grid">
+        <div class="card">
+            <div class="label">Status</div>
+            <div class="value status-ok">Operational</div>
+        </div>
+        <div class="card">
+            <div class="label">Uptime</div>
+            <div class="value">$uptimeStr</div>
+        </div>
+        <div class="card">
+            <div class="label">Database</div>
+            <div class="value">$dbStatus</div>
+        </div>
+        <div class="card">
+            <div class="label">Active Jobs</div>
+            <div class="value $(if ($activeJobs -gt 0) { 'status-warn' } else { '' })">$activeJobs</div>
+        </div>
+    </div>
+
+    <div class="section-title">Job Statistics (All Time)</div>
+    <div class="grid">
+        <div class="card">
+            <div class="label">Total Runs</div>
+            <div class="value">$totalRuns</div>
+            <div class="sub">$completed completed &middot; $failed failed</div>
+            <div class="bar-container">
+                <div class="bar-fill bar-green" style="width: ${successRate}%"></div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="label">Success Rate</div>
+            <div class="value $(if ($successRate -ge 80) { 'status-ok' } elseif ($successRate -ge 50) { 'status-warn' } else { 'status-error' })">$successRate%</div>
+        </div>
+        <div class="card">
+            <div class="label">Avg Duration</div>
+            <div class="value">$avgStr</div>
+            <div class="sub">${avgMs}ms</div>
+        </div>
+        <div class="card">
+            <div class="label">Min Duration</div>
+            <div class="value">$minStr</div>
+            <div class="sub">${minMs}ms</div>
+        </div>
+        <div class="card">
+            <div class="label">Max Duration</div>
+            <div class="value">$maxStr</div>
+            <div class="sub">${maxMs}ms</div>
+        </div>
+        <div class="card">
+            <div class="label">Last Run</div>
+            <div class="value" style="font-size: 1rem;">$lastRun</div>
+        </div>
+    </div>
+
+    <div class="footer">
+        <a href="/health">/health</a> (JSON) &middot; Maester API v1.0
+    </div>
+</div>
+</body>
+</html>
+"@
+
+        Write-PodeHtmlResponse -Value $html
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
     # GET /health — Container health check (no auth)
     # ══════════════════════════════════════════════════════════════════════════
     Add-PodeRoute -Method Get -Path '/health' -ScriptBlock {
         $dbPath    = $using:DB_PATH
         $startTime = $using:SERVER_START_TIME
 
+        # Re-source db helpers (Pode runspaces don't share parent scope)
+        . /app/lib/db.ps1
+
         $dbOk       = $false
         $activeJobs = 0
+        $stats      = $null
         try {
             Import-Module PSSQLite -ErrorAction SilentlyContinue
             $row = Invoke-SqliteQuery -DataSource $dbPath -Query "SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'"
             $activeJobs = [int]$row.cnt
             $dbOk = $true
+            $stats = Get-JobStats -DbPath $dbPath
         } catch { }
 
         $uptimeSec = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
 
-        Write-PodeJsonResponse -Value ([ordered]@{
-            status      = 'ok'
-            uptime      = $uptimeSec
-            dbConnected = $dbOk
-            activeJobs  = $activeJobs
-        })
+        $response = [ordered]@{
+            status         = 'ok'
+            uptime         = $uptimeSec
+            dbConnected    = $dbOk
+            activeJobs     = $activeJobs
+            totalCompleted = if ($stats) { $stats.totalCompleted } else { 0 }
+            totalFailed    = if ($stats) { $stats.totalFailed }    else { 0 }
+            avgDurationMs  = if ($stats) { $stats.avgDurationMs }  else { 0 }
+            minDurationMs  = if ($stats) { $stats.minDurationMs }  else { 0 }
+            maxDurationMs  = if ($stats) { $stats.maxDurationMs }  else { 0 }
+            lastCompletedAt = if ($stats) { $stats.lastCompletedAt } else { $null }
+        }
+
+        Write-PodeJsonResponse -Value $response
     }
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -172,6 +352,8 @@ Start-PodeServer -Threads 1 {
         $staleMinutes = $using:JOB_STALE_MINUTES
 
         Import-Module PSSQLite -ErrorAction SilentlyContinue
+        # Re-source db helpers (Pode runspaces don't share parent scope)
+        . /app/lib/db.ps1
 
         # ── Validate jobId ────────────────────────────────────────────────────
         $jobId = $WebEvent.Query['jobId']
@@ -239,6 +421,15 @@ Start-PodeServer -Threads 1 {
         # immediately when the frontend picks up the final result, rather than
         # waiting up to 15 minutes for the scheduled cleanup timer.
         if ($job.status -in @('completed', 'failed')) {
+            # Persist stats before deleting the job row
+            try {
+                Record-JobCompletion -DbPath $dbPath `
+                    -JobId       $job.job_id `
+                    -Status      $job.status `
+                    -DurationMs  ([int]($job.duration_ms)) `
+                    -Suites      $job.suites
+            } catch { }
+
             Invoke-SqliteQuery -DataSource $dbPath -Query @"
                 DELETE FROM jobs WHERE job_id = @jobId
 "@ -SqlParameters @{ jobId = $jobId } -ErrorAction SilentlyContinue
