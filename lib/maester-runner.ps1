@@ -109,18 +109,27 @@ $MaesterRunnerScriptBlock = {
         $null = New-Item -ItemType Directory -Path $invocationTempDir -Force
 
         # ── 3. Connect to Microsoft Graph (REQUIRED) ─────────────────────────
-        # Primary path: use the MSAL workspace $GraphToken forwarded by the
-        # caller via Authorization: Bearer header.
-        # Fallback: acquire a Graph app-only token via client_credentials when
-        # app-reg credentials are supplied and no MSAL token is available.
-        $graphTokenToUse = $GraphToken
-        if (-not $graphTokenToUse -and $MaesterClientId -and $MaesterClientSecret -and $TenantId) {
-            Write-Host '[maester-runner] No MSAL Graph token supplied — acquiring via client_credentials.'
+        # When app-registration credentials are available, ALWAYS use them to
+        # acquire a Graph token via client_credentials.  This token carries the
+        # full application permission set granted to the app-reg — it does not
+        # depend on delegated consent from the user.
+        #
+        # The MSAL workspace token ($GraphToken) forwarded by PipePal is used
+        # only for proxy-route auth and may carry only BASE scopes; it is NOT
+        # sufficient for the broad Graph queries Maester runs.
+        $graphTokenToUse = $null
+        if ($MaesterClientId -and $MaesterClientSecret -and $TenantId) {
+            Write-Host '[maester-runner] Acquiring Graph token via client_credentials (app-registration).'
             $graphTokenToUse = Get-ClientCredentialToken `
                 -TenantId     $TenantId `
                 -ClientId     $MaesterClientId `
                 -ClientSecret $MaesterClientSecret `
                 -Scope        'https://graph.microsoft.com/.default'
+        }
+        # Fallback: use the delegated MSAL token if no app creds were supplied.
+        if (-not $graphTokenToUse -and $GraphToken) {
+            Write-Host '[maester-runner] No app credentials — using delegated MSAL Graph token.'
+            $graphTokenToUse = $GraphToken
         }
 
         if (-not $graphTokenToUse) {

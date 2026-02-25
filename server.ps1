@@ -6,7 +6,7 @@
 # API contract:
 #
 #   POST /api/maester
-#     Authorization: Bearer <graphToken>    (device code delegated token)
+#     Authorization: Bearer <token>         (MSAL workspace token — BASE scopes for proxy auth)
 #     X-Exchange-Token: <token>             (optional, for Exchange Online tests)
 #     X-Teams-Token: <token>                (optional, for Microsoft Teams tests)
 #     X-IPPS-Token: <token>                 (optional, for Security & Compliance tests)
@@ -425,7 +425,7 @@ Start-PodeServer -Threads 1 {
     </div>
 
     <div class="footer">
-        <a href="/health">/health</a> (JSON) &middot; Maester API v1.0 &middot; <span id="last-updated">Connecting&hellip;</span>
+        <a href="/health">/health</a> (JSON) &middot; Maester API v1.1 &middot; <span id="last-updated">Connecting&hellip;</span>
     </div>
 </div>
 <script>
