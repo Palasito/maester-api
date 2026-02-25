@@ -4,8 +4,8 @@
 #   Layer 1 — API key: X-Functions-Key or X-Api-Key header (all routes except /health)
 #   Layer 2 — Bearer token: Authorization header (POST only, per-request)
 #
-# Phase 1: Graph token only (Authorization header)
-# Phase 3: + Exchange token (X-Exchange-Token) + Teams token (X-Teams-Token)
+# Bearer token is the MSAL workspace token (BASE scopes) used for proxy-route auth.
+# The runner acquires all service tokens itself via client_credentials grant.
 
 # ── API Key validation ────────────────────────────────────────────────────────
 
@@ -49,21 +49,4 @@ function Get-BearerToken {
     $token = $authHeader.Substring(7).Trim()
     if ($token.Length -lt 10) { return $null }   # sanity check
     return $token
-}
-
-# ── Service token bundle (Phase 1: Graph only) ───────────────────────────────
-
-function Get-ServiceTokens {
-    <#
-    .SYNOPSIS  Return a hashtable of per-service tokens extracted from headers.
-               Phase 1: only Graph (from Authorization header).
-               Phase 3: adds Exchange (X-Exchange-Token) and Teams (X-Teams-Token).
-    #>
-    param([Parameter(Mandatory)] $Headers)
-
-    return @{
-        Graph    = Get-BearerToken -Headers $Headers         # REQUIRED
-        Exchange = $Headers['X-Exchange-Token']               # Phase 3 — optional
-        Teams    = $Headers['X-Teams-Token']                  # Phase 3 — optional
-    }
 }

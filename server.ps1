@@ -7,9 +7,8 @@
 #
 #   POST /api/maester
 #     Authorization: Bearer <token>         (MSAL workspace token — BASE scopes for proxy auth)
-#     X-Exchange-Token: <token>             (optional, for Exchange Online tests)
-#     X-Teams-Token: <token>                (optional, for Microsoft Teams tests)
-#     X-IPPS-Token: <token>                 (optional, for Security & Compliance tests)
+#     X-Maester-Client-Id: <clientId>       (app-registration credentials for client_credentials grant)
+#     X-Maester-Client-Secret: <secret>     (app-registration secret)
 #     X-Functions-Key: <apiKey>   (or X-Api-Key)
 #     Body: { suites, severity?, tags?, includeLongRunning?, includePreview?,
 #             tenantId?, includeExchange?, includeTeams? }
@@ -681,7 +680,7 @@ setInterval(poll, 1000);
         Import-Module PSSQLite -ErrorAction SilentlyContinue
         . /app/lib/auth.ps1
 
-        # ── 1. Extract bearer token (device code delegated flow) ─────────────
+        # ── 1. Extract bearer token (MSAL workspace token — proxy auth) ─────────────
         $rawToken = Get-BearerToken -Headers $WebEvent.Request.Headers
         if (-not $rawToken) {
             $WebEvent.Response.StatusCode = 401
