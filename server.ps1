@@ -363,34 +363,34 @@ Start-PodeServer -Threads 1 {
     <div class="grid">
         <div class="card">
             <div class="label">Total Runs</div>
-            <div class="value">$totalRuns</div>
-            <div class="sub">$completed completed &middot; $failed failed</div>
+            <div class="value" id="total-runs-val">$totalRuns</div>
+            <div class="sub" id="total-runs-sub">$completed completed &middot; $failed failed</div>
             <div class="bar-container">
-                <div class="bar-fill bar-green" style="width: ${successRate}%"></div>
+                <div class="bar-fill bar-green" id="success-rate-bar" style="width: ${successRate}%"></div>
             </div>
         </div>
         <div class="card">
             <div class="label">Success Rate</div>
-            <div class="value $(if ($successRate -ge 80) { 'status-ok' } elseif ($successRate -ge 50) { 'status-warn' } else { 'status-error' })">$successRate%</div>
+            <div class="value $(if ($successRate -ge 80) { 'status-ok' } elseif ($successRate -ge 50) { 'status-warn' } else { 'status-error' })" id="success-rate-val">$successRate%</div>
         </div>
         <div class="card">
             <div class="label">Avg Duration</div>
-            <div class="value">$avgStr</div>
-            <div class="sub">${avgMs}ms</div>
+            <div class="value" id="avg-dur-val">$avgStr</div>
+            <div class="sub" id="avg-dur-sub">${avgMs}ms</div>
         </div>
         <div class="card">
             <div class="label">Min Duration</div>
-            <div class="value">$minStr</div>
-            <div class="sub">${minMs}ms</div>
+            <div class="value" id="min-dur-val">$minStr</div>
+            <div class="sub" id="min-dur-sub">${minMs}ms</div>
         </div>
         <div class="card">
             <div class="label">Max Duration</div>
-            <div class="value">$maxStr</div>
-            <div class="sub">${maxMs}ms</div>
+            <div class="value" id="max-dur-val">$maxStr</div>
+            <div class="sub" id="max-dur-sub">${maxMs}ms</div>
         </div>
         <div class="card">
             <div class="label">Last Run</div>
-            <div class="value" style="font-size: 1rem;">$lastRun</div>
+            <div class="value" id="last-run-val" style="font-size: 1rem;">$lastRun</div>
         </div>
     </div>
 
@@ -442,6 +442,12 @@ function setValueCls(id, cls) {
 function fmtUptime(s) {
     return Math.floor(s/86400)+'d '+Math.floor((s%86400)/3600)+'h '+Math.floor((s%3600)/60)+'m '+(s%60)+'s';
 }
+function fmtDur(ms) {
+    if (!ms || ms <= 0) return 'N/A';
+    var s = Math.round(ms / 1000);
+    if (s < 60) return s + 's';
+    return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+}
 function poll() {
     fetch('/health').then(function(r) { return r.json(); }).then(function(d) {
         setText('uptime-val', fmtUptime(d.uptime));
@@ -459,6 +465,18 @@ function poll() {
         setHtml('ram-used-sub', d.ramTotalMB > 0 ? ('of ' + d.ramTotalMB + ' MB (' + d.ramPercent + '%)') : '(no limit set)');
         setText('ram-avg-val', d.ramAvgMB + ' MB');
         setHtml('ram-avg-sub', d.ramTotalMB > 0 ? (d.ramAvgPercent + '% &middot; Rolling 1-hour') : 'Rolling 1-hour window');
+
+        var totalRuns = (d.totalCompleted || 0) + (d.totalFailed || 0);
+        var successRate = totalRuns > 0 ? Math.round((d.totalCompleted / totalRuns) * 1000) / 10 : 0;
+        setText('total-runs-val', totalRuns);
+        setHtml('total-runs-sub', (d.totalCompleted || 0) + ' completed &middot; ' + (d.totalFailed || 0) + ' failed');
+        var srBar = el('success-rate-bar'); if (srBar) srBar.style.width = successRate + '%';
+        setText('success-rate-val', successRate + '%');
+        setValueCls('success-rate-val', totalRuns > 0 ? (successRate >= 80 ? 'status-ok' : successRate >= 50 ? 'status-warn' : 'status-error') : '');
+        setText('avg-dur-val', fmtDur(d.avgDurationMs)); setText('avg-dur-sub', (d.avgDurationMs || 0) + 'ms');
+        setText('min-dur-val', fmtDur(d.minDurationMs)); setText('min-dur-sub', (d.minDurationMs || 0) + 'ms');
+        setText('max-dur-val', fmtDur(d.maxDurationMs)); setText('max-dur-sub', (d.maxDurationMs || 0) + 'ms');
+        setText('last-run-val', d.lastCompletedAt || 'N/A');
 
         setText('last-updated', 'Updated ' + new Date().toLocaleTimeString());
     }).catch(function() { setText('last-updated', 'Poll failed — retrying…'); });
