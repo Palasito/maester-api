@@ -32,6 +32,19 @@ WORKDIR /app
 COPY server.ps1 /app/server.ps1
 COPY lib/       /app/lib/
 
+# ─── Security: Run as non-root user ─────────────────────────────────────────
+# Create a dedicated unprivileged user for the API server.
+# This limits blast radius if the application is compromised.
+RUN adduser -D -h /app -s /sbin/nologin maester-api && \
+    mkdir -p /app/data && \
+    chown -R maester-api:maester-api /app /tmp
+
+# Switch to non-root user
+USER maester-api
+
+# Use a dedicated data directory for SQLite (not world-readable /tmp)
+ENV MAESTER_DB_PATH=/app/data/maester.db
+
 EXPOSE 80
 
 CMD ["pwsh", "-NoProfile", "-NonInteractive", "-File", "/app/server.ps1"]

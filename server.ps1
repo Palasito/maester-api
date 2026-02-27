@@ -50,6 +50,13 @@ Write-Host '[server] Loading lib/ modules...'
 . /app/lib/inventory-builder.ps1
 Write-Host '[server] lib/ modules loaded.'
 
+# ─── Security: Validate required environment variables at startup ─────────────
+if (-not $env:MAESTER_API_KEY) {
+    Write-Error '[server] FATAL: MAESTER_API_KEY environment variable is not set. The API will deny ALL requests (fail-closed). Set this variable before starting the server.'
+    # Don't exit — the server can still start (fail-closed is safe), but warn loudly.
+    Write-Host '[server] WARNING: Server starting in LOCKDOWN mode — all /api/* requests will be rejected.'
+}
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 $DB_PATH             = if ($env:MAESTER_DB_PATH) { $env:MAESTER_DB_PATH } else { '/tmp/maester.db' }
 # Only 1 concurrent job allowed — running two Maester runs against the same
@@ -106,6 +113,100 @@ Write-Host '[server] Starting Pode server on port 80...'
 Start-PodeServer -Threads 1 {
 
     Add-PodeEndpoint -Address * -Port 80 -Protocol Http
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Security: Response headers middleware (all routes)
+    # ══════════════════════════════════════════════════════════════════════════
+    Add-PodeMiddleware -Name 'SecurityHeaders' -ScriptBlock {
+        # Prevent MIME-type sniffing
+        $WebEvent.Response.Headers['X-Content-Type-Options'] = 'nosniff'
+        # Prevent clickjacking
+        $WebEvent.Response.Headers['X-Frame-Options'] = 'DENY'
+        # Referrer policy
+        $WebEvent.Response.Headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+        # Disable unnecessary browser features
+        $WebEvent.Response.Headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
+        # XSS protection for legacy browsers
+        $WebEvent.Response.Headers['X-XSS-Protection'] = '1; mode=block'
+        # Force HTTPS (respected when behind TLS-terminating proxy)
+        $WebEvent.Response.Headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+        # Cache-Control: prevent caching of API responses
+        $WebEvent.Response.Headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+        $WebEvent.Response.Headers['Pragma'] = 'no-cache'
+        return $true
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Security: CORS — restrict to known origins only
+    # ══════════════════════════════════════════════════════════════════════════
+    Add-PodeMiddleware -Name 'CorsPolicy' -ScriptBlock {
+        $origin = $WebEvent.Request.Headers['Origin']
+        # Allow requests with no Origin header (same-origin, curl, health checks)
+        if ($origin) {
+            $allowedOrigins = @(
+                'https://pipepal.azurewebsites.net',
+                'http://localhost:3000'
+            )
+            if ($origin -in $allowedOrigins) {
+                $WebEvent.Response.Headers['Access-Control-Allow-Origin']  = $origin
+                $WebEvent.Response.Headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+                $WebEvent.Response.Headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type, X-Functions-Key, X-Api-Key, X-Maester-Client-Id, X-Maester-Client-Secret'
+                $WebEvent.Response.Headers['Access-Control-Max-Age']       = '86400'
+                $WebEvent.Response.Headers['Vary']                         = 'Origin'
+            }
+            # Reject preflight from unknown origins
+            if ($WebEvent.Request.Method -eq 'OPTIONS') {
+                if ($origin -notin $allowedOrigins) {
+                    $WebEvent.Response.StatusCode = 403
+                    Write-PodeJsonResponse -Value @{ error = 'Origin not allowed.' }
+                    return $false
+                }
+                $WebEvent.Response.StatusCode = 204
+                return $false
+            }
+        }
+        return $true
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Security: Rate limiting state (in-memory sliding window)
+    # ══════════════════════════════════════════════════════════════════════════
+    Set-PodeState -Name 'RateLimiter' -Value @{
+        # IP → list of request timestamps (sliding window)
+        Requests = [hashtable]::Synchronized(@{})
+    }
+
+    Add-PodeMiddleware -Name 'RateLimiter' -Route '/api/*' -ScriptBlock {
+        $maxRequests   = 30    # Max requests per window
+        $windowSeconds = 60    # Sliding window size
+
+        $clientIp = $WebEvent.Request.RemoteEndPoint.Address.ToString()
+        if (-not $clientIp) { $clientIp = 'unknown' }
+
+        $now    = [datetime]::UtcNow
+        $cutoff = $now.AddSeconds(-$windowSeconds)
+
+        Lock-PodeObject -Name 'RateLimitLock' -ScriptBlock {
+            $rl = Get-PodeState -Name 'RateLimiter'
+            if (-not $rl.Requests.ContainsKey($clientIp)) {
+                $rl.Requests[$clientIp] = [System.Collections.ArrayList]::new()
+            }
+            $timestamps = $rl.Requests[$clientIp]
+            # Purge expired entries
+            $expired = @($timestamps | Where-Object { $_ -lt $cutoff })
+            foreach ($e in $expired) { $timestamps.Remove($e) }
+
+            if ($timestamps.Count -ge $maxRequests) {
+                $WebEvent.Response.StatusCode = 429
+                $WebEvent.Response.Headers['Retry-After'] = $windowSeconds.ToString()
+                Write-PodeJsonResponse -Value @{ error = 'Too many requests. Please slow down.' }
+                return $false
+            }
+
+            $timestamps.Add($now) | Out-Null
+        }
+        return $true
+    }
 
     # ══════════════════════════════════════════════════════════════════════════
     # Resource monitoring: CPU + RAM sampling every 30 seconds
@@ -190,14 +291,15 @@ Start-PodeServer -Threads 1 {
 
         if (-not (Test-ApiKey -Headers $WebEvent.Request.Headers)) {
             $WebEvent.Response.StatusCode = 401
-            Write-PodeJsonResponse -Value @{ error = 'Unauthorized — missing or invalid API key.' }
+            # Generic message — never reveal whether the key is missing vs invalid
+            Write-PodeJsonResponse -Value @{ error = 'Unauthorized.' }
             return $false
         }
         return $true
     }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # GET / — HTML stats dashboard (no auth)
+    # GET / — HTML stats dashboard (public)
     # ══════════════════════════════════════════════════════════════════════════
     Add-PodeRoute -Method Get -Path '/' -ScriptBlock {
         $dbPath    = $using:DB_PATH
@@ -492,7 +594,8 @@ setInterval(poll, 1000);
     }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # GET /health — Container health check (no auth)
+    # GET /health — Container health check (minimal info without auth,
+    #               full details with valid API key)
     # ══════════════════════════════════════════════════════════════════════════
     Add-PodeRoute -Method Get -Path '/health' -ScriptBlock {
         $dbPath    = $using:DB_PATH
@@ -511,6 +614,10 @@ setInterval(poll, 1000);
             $dbOk = $true
             $stats = Get-JobStats -DbPath $dbPath
         } catch { }
+
+        $uptimeSec = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
+
+        # Return full operational metrics (public)
 
         # ── Resource metrics (live RAM + averages from sampler) ───────────
         $res = @{ cpuPercent = 0; cpuAvgPercent = 0; ramUsedMB = 0; ramTotalMB = 0; ramAvgMB = 0 }
@@ -605,6 +712,12 @@ setInterval(poll, 1000);
             Write-PodeJsonResponse -Value @{ error = 'Missing required query parameter: jobId' }
             return
         }
+        # Validate jobId format (32-char hex GUID without dashes)
+        if ($jobId -notmatch '^[0-9a-fA-F]{32}$') {
+            $WebEvent.Response.StatusCode = 400
+            Write-PodeJsonResponse -Value @{ error = 'Invalid jobId format.' }
+            return
+        }
 
         # ── Fetch from SQLite ─────────────────────────────────────────────────
         $job = Invoke-SqliteQuery -DataSource $dbPath -Query @"
@@ -613,7 +726,7 @@ setInterval(poll, 1000);
 
         if (-not $job) {
             $WebEvent.Response.StatusCode = 404
-            Write-PodeJsonResponse -Value ([ordered]@{ error = "Job not found: $jobId" })
+            Write-PodeJsonResponse -Value ([ordered]@{ error = 'Job not found.' })
             return
         }
 
@@ -698,12 +811,20 @@ setInterval(poll, 1000);
         Import-Module PSSQLite -ErrorAction SilentlyContinue
         . /app/lib/auth.ps1
 
+        # ── 0. Request size guard (max 64KB body) ─────────────────────────────
+        $contentLength = $WebEvent.Request.Headers['Content-Length']
+        if ($contentLength -and [long]$contentLength -gt 65536) {
+            $WebEvent.Response.StatusCode = 413
+            Write-PodeJsonResponse -Value @{ error = 'Request body too large.' }
+            return
+        }
+
         # ── 1. Extract bearer token (MSAL workspace token — proxy auth) ─────────────
         $rawToken = Get-BearerToken -Headers $WebEvent.Request.Headers
         if (-not $rawToken) {
             $WebEvent.Response.StatusCode = 401
             Write-PodeJsonResponse -Value @{
-                error = 'Missing authentication. Provide Authorization: Bearer <token>.'
+                error = 'Authentication required.'
             }
             return
         }
@@ -714,23 +835,47 @@ setInterval(poll, 1000);
         $maesterClientId     = $WebEvent.Request.Headers['X-Maester-Client-Id']
         $maesterClientSecret = $WebEvent.Request.Headers['X-Maester-Client-Secret']
 
-        # ── 2. Parse request body ────────────────────────────────────────────
+        # ── 2. Parse and validate request body ───────────────────────────────
         try {
             $body           = $WebEvent.Data
-            $suites         = if ($body.suites)                       { @($body.suites) }             else { @('maester','cisa','eidsca','orca','cis') }
-            $severities     = if ($body.severity)                     { @($body.severity) }           else { @('Critical','High','Medium','Low','Info') }
-            $extraTags      = if ($body.tags)                         { @($body.tags) }               else { @() }
+
+            # Validate suites against allowlist
+            $allowedSuites = @('maester','cisa','eidsca','orca','cis','xspm')
+            $suites         = if ($body.suites) {
+                @($body.suites | Where-Object { $_ -in $allowedSuites })
+            } else { @('maester','cisa','eidsca','orca','cis') }
+            if ($suites.Count -eq 0) { $suites = @('maester','cisa','eidsca','orca','cis') }
+
+            # Validate severities against allowlist
+            $allowedSeverities = @('Critical','High','Medium','Low','Info')
+            $severities     = if ($body.severity) {
+                @($body.severity | Where-Object { $_ -in $allowedSeverities })
+            } else { @('Critical','High','Medium','Low','Info') }
+            if ($severities.Count -eq 0) { $severities = @('Critical','High','Medium','Low','Info') }
+
+            $extraTags      = if ($body.tags) {
+                # Sanitize tags: alphanumeric, dots, hyphens, colons only
+                @($body.tags | ForEach-Object { $_ -replace '[^A-Za-z0-9.:\-_]', '' } | Where-Object { $_ })
+            } else { @() }
             $incLongRunning = if ($null -ne $body.includeLongRunning) { [bool]$body.includeLongRunning } else { $true  }
             # Default Preview to $true — many EIDSCA tests are tagged Preview and excluding
             # them by default was causing the majority of skipped results.
             $incPreview     = if ($null -ne $body.includePreview)     { [bool]$body.includePreview }     else { $true  }
 
-            # Phase 3: tenantId needed for Exchange Online connection (-Organization)
-            $tenantId       = if ($body.tenantId) { [string]$body.tenantId } else { '' }
+            # Validate tenantId format (must be a valid GUID if provided)
+            $tenantId = ''
+            if ($body.tenantId) {
+                $tenantId = [string]$body.tenantId
+                if (-not (Test-ValidTenantId -TenantId $tenantId)) {
+                    $WebEvent.Response.StatusCode = 400
+                    Write-PodeJsonResponse -Value @{ error = 'Invalid tenantId format. Must be a valid GUID.' }
+                    return
+                }
+            }
 
         } catch {
             $WebEvent.Response.StatusCode = 400
-            Write-PodeJsonResponse -Value ([ordered]@{ error = "Failed to parse request body: $($_.Exception.Message)" })
+            Write-PodeJsonResponse -Value ([ordered]@{ error = 'Invalid request body.' })
             return
         }
 

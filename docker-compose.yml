@@ -12,9 +12,10 @@ services:
       - "7071:80"
     environment:
       # API key for proxy authentication (matches PipePal's x-functions-key)
-      - MAESTER_API_KEY=${MAESTER_API_KEY:-local-dev-key}
-      # Optional: override SQLite path for persistence
-      # - MAESTER_DB_PATH=/data/maester.db
+      # SECURITY: No default fallback — MAESTER_API_KEY MUST be set in .env
+      - MAESTER_API_KEY=${MAESTER_API_KEY:?MAESTER_API_KEY is required - set it in .env}
+      # SQLite stored in app-owned directory (not world-readable /tmp)
+      - MAESTER_DB_PATH=/app/data/maester.db
     # volumes:
     #   - maester-data:/data     # Uncomment for persistent DB across restarts
     restart: unless-stopped

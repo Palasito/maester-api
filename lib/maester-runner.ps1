@@ -40,6 +40,7 @@ $MaesterRunnerScriptBlock = {
     # call functions from the parent scope).
 
     # Acquire an app-only access token via the OAuth 2.0 client_credentials grant.
+    # SECURITY: This function handles secrets — never log the client_secret or resulting tokens.
     function Get-ClientCredentialToken {
         param(
             [string] $TenantId,
@@ -581,7 +582,15 @@ $MaesterRunnerScriptBlock = {
         Disconnect-ExchangeOnline   -Confirm:$false -ErrorAction SilentlyContinue
         Disconnect-MicrosoftTeams   -ErrorAction SilentlyContinue
         try { Disconnect-AzAccount  -ErrorAction SilentlyContinue | Out-Null } catch { }
+        # Sanitize error message — never leak file paths, stack traces, or secrets
         $errMsg = $_.Exception.Message
+        # Strip file paths
+        $errMsg = $errMsg -replace '[A-Za-z]:\\[^\s"'']+', '[path]'
+        $errMsg = $errMsg -replace '/[^\s"'']*\.(ps1|psm1|psd1|dll|exe)', '[path]'
+        # Strip anything that looks like a token/secret (long base64-like strings)
+        $errMsg = $errMsg -replace '[A-Za-z0-9+/=]{40,}', '[redacted]'
+        # Truncate to prevent DB bloat
+        if ($errMsg.Length -gt 500) { $errMsg = $errMsg.Substring(0, 500) + '...' }
         try { Update-Job -Status 'failed' -Result $null -ErrorMsg $errMsg -DurationMs 0 } catch { }
     }
     finally {
