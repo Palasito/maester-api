@@ -192,9 +192,17 @@ Start-PodeServer -Threads 1 {
                 $rl.Requests[$clientIp] = [System.Collections.ArrayList]::new()
             }
             $timestamps = $rl.Requests[$clientIp]
-            # Purge expired entries
+            # Purge expired timestamps for this IP
             $expired = @($timestamps | Where-Object { $_ -lt $cutoff })
             foreach ($e in $expired) { $timestamps.Remove($e) }
+
+            # Memory leak fix: remove stale IP entries that have no recent activity.
+            # Without this, every unique IP (health probes, load balancers, etc.)
+            # accumulates an empty ArrayList entry forever.
+            $staleIps = @($rl.Requests.Keys | Where-Object {
+                $rl.Requests[$_].Count -eq 0 -and $_ -ne $clientIp
+            })
+            foreach ($ip in $staleIps) { $rl.Requests.Remove($ip) }
 
             if ($timestamps.Count -ge $maxRequests) {
                 $WebEvent.Response.StatusCode = 429
@@ -986,5 +994,12 @@ setInterval(poll, 1000);
             Invoke-SqliteQuery -DataSource $dbPath -Query 'PRAGMA incremental_vacuum;'
         }
         catch { }
+
+        # 5. Force .NET garbage collection to return reclaimed memory to the OS.
+        # PowerShell does not aggressively GC on its own; this prevents the process
+        # RSS from drifting upward indefinitely on long-running servers.
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+        [System.GC]::Collect()
     }
 }
