@@ -107,6 +107,37 @@ Write-Host "[server] Initialising SQLite at $DB_PATH ..."
 Initialize-MaesterDb -DbPath $DB_PATH
 Write-Host '[server] SQLite ready.'
 
+# ─── Pre-compute initial health data ─────────────────────────────────────────
+# Seed health cache once at startup so the first 30 seconds of dashboard/health
+# requests return real data instead of zeros.
+$INITIAL_HEALTH = @{
+    dbConnected     = $false
+    activeJobs      = [int]0
+    totalCompleted  = [int]0
+    totalFailed     = [int]0
+    avgDurationMs   = [int]0
+    minDurationMs   = [int]0
+    maxDurationMs   = [int]0
+    lastCompletedAt = $null
+}
+try {
+    $initRow = Invoke-SqliteQuery -DataSource $DB_PATH -Query "SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'"
+    $INITIAL_HEALTH.activeJobs = [int]$initRow.cnt
+    $initStats = Get-JobStats -DbPath $DB_PATH
+    if ($initStats) {
+        $INITIAL_HEALTH.totalCompleted  = [int]$initStats.totalCompleted
+        $INITIAL_HEALTH.totalFailed     = [int]$initStats.totalFailed
+        $INITIAL_HEALTH.avgDurationMs   = [int]$initStats.avgDurationMs
+        $INITIAL_HEALTH.minDurationMs   = [int]$initStats.minDurationMs
+        $INITIAL_HEALTH.maxDurationMs   = [int]$initStats.maxDurationMs
+        $INITIAL_HEALTH.lastCompletedAt = $initStats.lastCompletedAt
+    }
+    $INITIAL_HEALTH.dbConnected = $true
+    Write-Host '[server] Initial health data seeded from SQLite.'
+} catch {
+    Write-Host "[server] WARNING: Could not seed health data ($($_.Exception.Message)). Will populate on first timer tick."
+}
+
 # ─── Start Pode HTTP server ──────────────────────────────────────────────────
 Write-Host '[server] Starting Pode server on port 80...'
 
@@ -176,6 +207,13 @@ Start-PodeServer -Threads 1 {
         Requests = [hashtable]::Synchronized(@{})
     }
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Health data cache (updated every 30s by ResourceSampler timer).
+    # /health and GET / read from this cache instead of querying SQLite
+    # on every request — eliminates dot-sourcing and Import-Module per call.
+    # ══════════════════════════════════════════════════════════════════════════
+    Set-PodeState -Name 'HealthCache' -Value ($using:INITIAL_HEALTH)
+
     Add-PodeMiddleware -Name 'RateLimiter' -Route '/api/*' -ScriptBlock {
         $maxRequests   = 30    # Max requests per window
         $windowSeconds = 60    # Sliding window size
@@ -230,12 +268,22 @@ Start-PodeServer -Threads 1 {
     } catch { }
 
     Set-PodeState -Name 'ResourceMonitor' -Value @{
-        Samples      = [System.Collections.ArrayList]::new()
+        # Fixed-size circular buffer — avoids ArrayList.RemoveAt(0) O(n) copy + heap fragmentation
+        Samples      = [object[]]::new(120)   # 120 slots = 1 hour at 30s intervals
+        WriteIndex   = [int]0                  # Next write position
+        Count        = [int]0                  # Valid samples (grows to 120 then stays)
         LastCpuIdle  = $initCpuIdle
         LastCpuTotal = $initCpuTotal
+        # Pre-computed values so /health doesn't need to iterate the buffer
+        LatestCpuPercent = [double]0
+        LatestRamUsedMB  = [double]0
+        LatestRamTotalMB = [double]0
+        AvgCpuPercent    = [double]0
+        AvgRamUsedMB     = [double]0
     }
 
     Add-PodeTimer -Name 'ResourceSampler' -Interval 30 -ScriptBlock {
+        $dbPath = $using:DB_PATH
         try {
             # ── CPU from /proc/stat ──────────────────────────────────────
             $cpuLine = (Get-Content /proc/stat -TotalCount 1) -replace '^cpu\s+', ''
@@ -278,16 +326,73 @@ Start-PodeServer -Threads 1 {
                 $mon.LastCpuIdle  = $idle
                 $mon.LastCpuTotal = $total
 
-                $mon.Samples.Add([PSCustomObject]@{
-                    CpuPercent = [double]$cpuPercent
-                    RamUsedMB  = [double]$ramUsedMB
-                    RamTotalMB = [double]$ramTotalMB
-                }) | Out-Null
+                # Write to circular buffer (no RemoveAt, no array copy)
+                $mon.Samples[$mon.WriteIndex] = @{
+                    Cpu    = [double]$cpuPercent
+                    Ram    = [double]$ramUsedMB
+                    RamMax = [double]$ramTotalMB
+                }
+                $mon.WriteIndex = ($mon.WriteIndex + 1) % 120
+                if ($mon.Count -lt 120) { $mon.Count++ }
 
-                # Keep last 120 samples (1 hour at 30s intervals)
-                while ($mon.Samples.Count -gt 120) { $mon.Samples.RemoveAt(0) }
+                # Store latest snapshot for fast reads
+                $mon.LatestCpuPercent = [double]$cpuPercent
+                $mon.LatestRamUsedMB  = [double]$ramUsedMB
+                $mon.LatestRamTotalMB = [double]$ramTotalMB
+
+                # Compute rolling averages from buffer
+                $sumCpu = [double]0; $sumRam = [double]0
+                for ($i = 0; $i -lt $mon.Count; $i++) {
+                    $s = $mon.Samples[$i]
+                    $sumCpu += $s.Cpu
+                    $sumRam += $s.Ram
+                }
+                $mon.AvgCpuPercent = [math]::Round($sumCpu / $mon.Count, 1)
+                $mon.AvgRamUsedMB  = [math]::Round($sumRam / $mon.Count, 1)
+            }
+
+            # ── Refresh health cache from SQLite ─────────────────────────
+            # Runs once every 30s instead of on every /health request.
+            # This eliminates dot-sourcing db.ps1 and Import-Module from
+            # the hot path (~1 call/s from dashboard polling).
+            try {
+                $row = Invoke-SqliteQuery -DataSource $dbPath -Query "SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'"
+                $statsRow = Invoke-SqliteQuery -DataSource $dbPath -Query @"
+                    SELECT
+                        COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS totalCompleted,
+                        COALESCE(SUM(CASE WHEN status = 'failed'    THEN 1 ELSE 0 END), 0) AS totalFailed,
+                        COALESCE(AVG(CASE WHEN status = 'completed' AND duration_ms > 0
+                                     THEN duration_ms END), 0)                              AS avgDurationMs,
+                        COALESCE(MIN(CASE WHEN status = 'completed' AND duration_ms > 0
+                                     THEN duration_ms END), 0)                              AS minDurationMs,
+                        COALESCE(MAX(CASE WHEN status = 'completed' AND duration_ms > 0
+                                     THEN duration_ms END), 0)                              AS maxDurationMs,
+                        MAX(completed_at)                                                    AS lastCompletedAt
+                    FROM job_stats
+"@
+                Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
+                    $hc = Get-PodeState -Name 'HealthCache'
+                    $hc.dbConnected     = $true
+                    $hc.activeJobs      = [int]$row.cnt
+                    if ($statsRow) {
+                        $hc.totalCompleted  = [int]$statsRow.totalCompleted
+                        $hc.totalFailed     = [int]$statsRow.totalFailed
+                        $hc.avgDurationMs   = [math]::Round([double]$statsRow.avgDurationMs)
+                        $hc.minDurationMs   = [int]$statsRow.minDurationMs
+                        $hc.maxDurationMs   = [int]$statsRow.maxDurationMs
+                        $hc.lastCompletedAt = if ($statsRow.lastCompletedAt) { $statsRow.lastCompletedAt } else { $null }
+                    }
+                }
+            } catch {
+                Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
+                    (Get-PodeState -Name 'HealthCache').dbConnected = $false
+                }
             }
         } catch { }
+
+        # Lightweight Gen-0 GC every 30 seconds to collect short-lived objects
+        # created by file reads, SQL queries, and string operations.
+        [System.GC]::Collect(0, [System.GCCollectionMode]::Optimized)
     }
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -308,39 +413,47 @@ Start-PodeServer -Threads 1 {
 
     # ══════════════════════════════════════════════════════════════════════════
     # GET / — HTML stats dashboard (public)
+    #
+    # MEMORY-CRITICAL: Reads all data from PodeState caches. No dot-sourcing,
+    # no Import-Module, no SQL. Data is refreshed every 30s by the
+    # ResourceSampler timer; JS polls /health to keep the page live.
     # ══════════════════════════════════════════════════════════════════════════
     Add-PodeRoute -Method Get -Path '/' -ScriptBlock {
-        $dbPath    = $using:DB_PATH
         $startTime = $using:SERVER_START_TIME
 
-        # Re-source db helpers (Pode runspaces don't share parent scope)
-        . /app/lib/db.ps1
+        # Read cached health data
+        $hc = @{}
+        Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
+            $hcState = Get-PodeState -Name 'HealthCache'
+            $hc = @{
+                dbConnected     = $hcState.dbConnected
+                activeJobs      = $hcState.activeJobs
+                totalCompleted  = $hcState.totalCompleted
+                totalFailed     = $hcState.totalFailed
+                avgDurationMs   = $hcState.avgDurationMs
+                minDurationMs   = $hcState.minDurationMs
+                maxDurationMs   = $hcState.maxDurationMs
+                lastCompletedAt = $hcState.lastCompletedAt
+            }
+        }
 
-        $dbOk       = $false
-        $activeJobs = 0
-        $stats      = $null
-        try {
-            Import-Module PSSQLite -ErrorAction SilentlyContinue
-            $row = Invoke-SqliteQuery -DataSource $dbPath -Query "SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'"
-            $activeJobs = [int]$row.cnt
-            $dbOk = $true
-            $stats = Get-JobStats -DbPath $dbPath
-        } catch { }
+        $dbOk       = $hc.dbConnected
+        $activeJobs = $hc.activeJobs
+        $completed  = $hc.totalCompleted
+        $failed     = $hc.totalFailed
+        $totalRuns  = $completed + $failed
+        $avgMs      = $hc.avgDurationMs
+        $minMs      = $hc.minDurationMs
+        $maxMs      = $hc.maxDurationMs
+        $lastRun    = if ($hc.lastCompletedAt) { $hc.lastCompletedAt } else { 'N/A' }
+        $successRate = if ($totalRuns -gt 0) { [math]::Round(($completed / $totalRuns) * 100, 1) } else { 0 }
 
-        $uptimeSec    = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
-        $uptimeStr    = '{0}d {1}h {2}m {3}s' -f [math]::Floor($uptimeSec / 86400),
-                        [math]::Floor(($uptimeSec % 86400) / 3600),
-                        [math]::Floor(($uptimeSec % 3600) / 60),
-                        ($uptimeSec % 60)
-        $dbStatus     = if ($dbOk) { '&#x2705; Connected' } else { '&#x274C; Disconnected' }
-        $completed    = if ($stats) { $stats.totalCompleted } else { 0 }
-        $failed       = if ($stats) { $stats.totalFailed }    else { 0 }
-        $totalRuns    = $completed + $failed
-        $avgMs        = if ($stats) { $stats.avgDurationMs }  else { 0 }
-        $minMs        = if ($stats) { $stats.minDurationMs }  else { 0 }
-        $maxMs        = if ($stats) { $stats.maxDurationMs }  else { 0 }
-        $lastRun      = if ($stats -and $stats.lastCompletedAt) { $stats.lastCompletedAt } else { 'N/A' }
-        $successRate  = if ($totalRuns -gt 0) { [math]::Round(($completed / $totalRuns) * 100, 1) } else { 0 }
+        $uptimeSec  = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
+        $uptimeStr  = '{0}d {1}h {2}m {3}s' -f [math]::Floor($uptimeSec / 86400),
+                      [math]::Floor(($uptimeSec % 86400) / 3600),
+                      [math]::Floor(($uptimeSec % 3600) / 60),
+                      ($uptimeSec % 60)
+        $dbStatus   = if ($dbOk) { '&#x2705; Connected' } else { '&#x274C; Disconnected' }
 
         # Format durations as human-readable
         function Format-Duration([int]$ms) {
@@ -355,35 +468,16 @@ Start-PodeServer -Threads 1 {
         $minStr = Format-Duration $minMs
         $maxStr = Format-Duration $maxMs
 
-        # ── Resource metrics ──────────────────────────────────────────────────
+        # ── Resource metrics from cached state ────────────────────────────
         $res = @{ cpuPercent = 0; cpuAvgPercent = 0; ramUsedMB = 0; ramTotalMB = 0; ramAvgMB = 0 }
-        try {
-            if (Test-Path '/sys/fs/cgroup/memory.current') {
-                $res.ramUsedMB  = [math]::Round([long](Get-Content '/sys/fs/cgroup/memory.current') / 1MB, 1)
-                $maxRaw         = (Get-Content '/sys/fs/cgroup/memory.max').Trim()
-                $res.ramTotalMB = if ($maxRaw -eq 'max') { 0 } else { [math]::Round([long]$maxRaw / 1MB, 1) }
-            }
-            elseif (Test-Path '/sys/fs/cgroup/memory/memory.usage_in_bytes') {
-                $res.ramUsedMB  = [math]::Round([long](Get-Content '/sys/fs/cgroup/memory/memory.usage_in_bytes') / 1MB, 1)
-                $limitRaw       = (Get-Content '/sys/fs/cgroup/memory/memory.limit_in_bytes').Trim()
-                $res.ramTotalMB = if ([long]$limitRaw -gt 1TB) { 0 } else { [math]::Round([long]$limitRaw / 1MB, 1) }
-            }
-            else {
-                $memInfo = Get-Content /proc/meminfo -ErrorAction SilentlyContinue
-                $totalKB = [long](($memInfo | Where-Object { $_ -match '^MemTotal:' }) -replace '\D+', '')
-                $availKB = [long](($memInfo | Where-Object { $_ -match '^MemAvailable:' }) -replace '\D+', '')
-                $res.ramTotalMB = [math]::Round($totalKB / 1024, 1)
-                $res.ramUsedMB  = [math]::Round(($totalKB - $availKB) / 1024, 1)
-            }
-            Lock-PodeObject -Name 'ResourceLock' -ScriptBlock {
-                $mon = Get-PodeState -Name 'ResourceMonitor'
-                if ($mon -and $mon.Samples.Count -gt 0) {
-                    $res.cpuPercent    = $mon.Samples[-1].CpuPercent
-                    $res.cpuAvgPercent = [math]::Round(($mon.Samples | Measure-Object -Property CpuPercent -Average).Average, 1)
-                    $res.ramAvgMB      = [math]::Round(($mon.Samples | Measure-Object -Property RamUsedMB  -Average).Average, 1)
-                }
-            }
-        } catch { }
+        Lock-PodeObject -Name 'ResourceLock' -ScriptBlock {
+            $mon = Get-PodeState -Name 'ResourceMonitor'
+            $res.cpuPercent    = $mon.LatestCpuPercent
+            $res.cpuAvgPercent = $mon.AvgCpuPercent
+            $res.ramUsedMB     = $mon.LatestRamUsedMB
+            $res.ramTotalMB    = $mon.LatestRamTotalMB
+            $res.ramAvgMB      = $mon.AvgRamUsedMB
+        }
         $ramPercent    = if ($res.ramTotalMB -gt 0) { [math]::Round(($res.ramUsedMB / $res.ramTotalMB) * 100, 1) } else { 0 }
         $ramAvgPercent = if ($res.ramTotalMB -gt 0) { [math]::Round(($res.ramAvgMB  / $res.ramTotalMB) * 100, 1) } else { 0 }
         $cpuColor  = if ($res.cpuPercent -ge 80) { 'status-error' } elseif ($res.cpuPercent -ge 50) { 'status-warn' } else { 'status-ok' }
@@ -592,7 +686,7 @@ function poll() {
     }).catch(function() { setText('last-updated', 'Poll failed — retrying…'); });
 }
 poll();
-setInterval(poll, 1000);
+setInterval(poll, 15000);
 </script>
 </body>
 </html>
@@ -602,89 +696,67 @@ setInterval(poll, 1000);
     }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # GET /health — Container health check (minimal info without auth,
-    #               full details with valid API key)
+    # GET /health — Container health check (public, lightweight)
+    #
+    # MEMORY-CRITICAL: This endpoint is polled every 15 seconds by the
+    # dashboard JS. It must NOT dot-source files, import modules, or run SQL.
+    # All data is read from PodeState caches updated by the ResourceSampler
+    # timer (every 30s). This eliminates ~389K dot-source + module-import
+    # operations over 4 days that caused the ~500MB idle memory leak.
     # ══════════════════════════════════════════════════════════════════════════
     Add-PodeRoute -Method Get -Path '/health' -ScriptBlock {
-        $dbPath    = $using:DB_PATH
         $startTime = $using:SERVER_START_TIME
-
-        # Re-source db helpers (Pode runspaces don't share parent scope)
-        . /app/lib/db.ps1
-
-        $dbOk       = $false
-        $activeJobs = 0
-        $stats      = $null
-        try {
-            Import-Module PSSQLite -ErrorAction SilentlyContinue
-            $row = Invoke-SqliteQuery -DataSource $dbPath -Query "SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'"
-            $activeJobs = [int]$row.cnt
-            $dbOk = $true
-            $stats = Get-JobStats -DbPath $dbPath
-        } catch { }
-
         $uptimeSec = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
 
-        # Return full operational metrics (public)
-
-        # ── Resource metrics (live RAM + averages from sampler) ───────────
-        $res = @{ cpuPercent = 0; cpuAvgPercent = 0; ramUsedMB = 0; ramTotalMB = 0; ramAvgMB = 0 }
-        try {
-            # Live RAM reading
-            if (Test-Path '/sys/fs/cgroup/memory.current') {
-                $res.ramUsedMB  = [math]::Round([long](Get-Content '/sys/fs/cgroup/memory.current') / 1MB, 1)
-                $maxRaw         = (Get-Content '/sys/fs/cgroup/memory.max').Trim()
-                $res.ramTotalMB = if ($maxRaw -eq 'max') { 0 } else { [math]::Round([long]$maxRaw / 1MB, 1) }
+        # Read cached health data (updated every 30s by ResourceSampler timer)
+        $hc = @{}
+        Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
+            $hcState = Get-PodeState -Name 'HealthCache'
+            $hc = @{
+                dbConnected     = $hcState.dbConnected
+                activeJobs      = $hcState.activeJobs
+                totalCompleted  = $hcState.totalCompleted
+                totalFailed     = $hcState.totalFailed
+                avgDurationMs   = $hcState.avgDurationMs
+                minDurationMs   = $hcState.minDurationMs
+                maxDurationMs   = $hcState.maxDurationMs
+                lastCompletedAt = $hcState.lastCompletedAt
             }
-            elseif (Test-Path '/sys/fs/cgroup/memory/memory.usage_in_bytes') {
-                $res.ramUsedMB  = [math]::Round([long](Get-Content '/sys/fs/cgroup/memory/memory.usage_in_bytes') / 1MB, 1)
-                $limitRaw       = (Get-Content '/sys/fs/cgroup/memory/memory.limit_in_bytes').Trim()
-                $res.ramTotalMB = if ([long]$limitRaw -gt 1TB) { 0 } else { [math]::Round([long]$limitRaw / 1MB, 1) }
-            }
-            else {
-                $memInfo = Get-Content /proc/meminfo -ErrorAction SilentlyContinue
-                $totalKB = [long](($memInfo | Where-Object { $_ -match '^MemTotal:' }) -replace '\D+', '')
-                $availKB = [long](($memInfo | Where-Object { $_ -match '^MemAvailable:' }) -replace '\D+', '')
-                $res.ramTotalMB = [math]::Round($totalKB / 1024, 1)
-                $res.ramUsedMB  = [math]::Round(($totalKB - $availKB) / 1024, 1)
-            }
-
-            # CPU current + averages from ResourceMonitor state
-            Lock-PodeObject -Name 'ResourceLock' -ScriptBlock {
-                $mon = Get-PodeState -Name 'ResourceMonitor'
-                if ($mon -and $mon.Samples.Count -gt 0) {
-                    $res.cpuPercent    = $mon.Samples[-1].CpuPercent
-                    $res.cpuAvgPercent = [math]::Round(($mon.Samples | Measure-Object -Property CpuPercent -Average).Average, 1)
-                    $res.ramAvgMB      = [math]::Round(($mon.Samples | Measure-Object -Property RamUsedMB  -Average).Average, 1)
-                }
-            }
-        } catch { }
-
-        $ramPercent    = if ($res.ramTotalMB -gt 0) { [math]::Round(($res.ramUsedMB / $res.ramTotalMB) * 100, 1) } else { 0 }
-        $ramAvgPercent = if ($res.ramTotalMB -gt 0) { [math]::Round(($res.ramAvgMB  / $res.ramTotalMB) * 100, 1) } else { 0 }
-        $uptimeSec     = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
-
-        $response = [ordered]@{
-            status          = 'ok'
-            uptime          = $uptimeSec
-            dbConnected     = $dbOk
-            activeJobs      = $activeJobs
-            cpuPercent      = $res.cpuPercent
-            cpuAvgPercent   = $res.cpuAvgPercent
-            ramUsedMB       = $res.ramUsedMB
-            ramTotalMB      = $res.ramTotalMB
-            ramPercent      = $ramPercent
-            ramAvgMB        = $res.ramAvgMB
-            ramAvgPercent   = $ramAvgPercent
-            totalCompleted  = if ($stats) { $stats.totalCompleted } else { 0 }
-            totalFailed     = if ($stats) { $stats.totalFailed }    else { 0 }
-            avgDurationMs   = if ($stats) { $stats.avgDurationMs }  else { 0 }
-            minDurationMs   = if ($stats) { $stats.minDurationMs }  else { 0 }
-            maxDurationMs   = if ($stats) { $stats.maxDurationMs }  else { 0 }
-            lastCompletedAt = if ($stats) { $stats.lastCompletedAt } else { $null }
         }
 
-        Write-PodeJsonResponse -Value $response
+        # Read cached resource metrics (updated every 30s by ResourceSampler timer)
+        $cpuPercent = 0; $cpuAvgPercent = 0; $ramUsedMB = 0; $ramTotalMB = 0; $ramAvgMB = 0
+        Lock-PodeObject -Name 'ResourceLock' -ScriptBlock {
+            $mon = Get-PodeState -Name 'ResourceMonitor'
+            $cpuPercent    = $mon.LatestCpuPercent
+            $cpuAvgPercent = $mon.AvgCpuPercent
+            $ramUsedMB     = $mon.LatestRamUsedMB
+            $ramTotalMB    = $mon.LatestRamTotalMB
+            $ramAvgMB      = $mon.AvgRamUsedMB
+        }
+
+        $ramPercent    = if ($ramTotalMB -gt 0) { [math]::Round(($ramUsedMB / $ramTotalMB) * 100, 1) } else { 0 }
+        $ramAvgPercent = if ($ramTotalMB -gt 0) { [math]::Round(($ramAvgMB  / $ramTotalMB) * 100, 1) } else { 0 }
+
+        Write-PodeJsonResponse -Value ([ordered]@{
+            status          = 'ok'
+            uptime          = $uptimeSec
+            dbConnected     = $hc.dbConnected
+            activeJobs      = $hc.activeJobs
+            cpuPercent      = $cpuPercent
+            cpuAvgPercent   = $cpuAvgPercent
+            ramUsedMB       = $ramUsedMB
+            ramTotalMB      = $ramTotalMB
+            ramPercent      = $ramPercent
+            ramAvgMB        = $ramAvgMB
+            ramAvgPercent   = $ramAvgPercent
+            totalCompleted  = $hc.totalCompleted
+            totalFailed     = $hc.totalFailed
+            avgDurationMs   = $hc.avgDurationMs
+            minDurationMs   = $hc.minDurationMs
+            maxDurationMs   = $hc.maxDurationMs
+            lastCompletedAt = $hc.lastCompletedAt
+        })
     }
 
     # ══════════════════════════════════════════════════════════════════════════
