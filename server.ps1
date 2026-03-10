@@ -212,7 +212,7 @@ Start-PodeServer -Threads 1 {
     # /health and GET / read from this cache instead of querying SQLite
     # on every request — eliminates dot-sourcing and Import-Module per call.
     # ══════════════════════════════════════════════════════════════════════════
-    Set-PodeState -Name 'HealthCache' -Value ($using:INITIAL_HEALTH)
+    Set-PodeState -Name 'HealthCache' -Value $INITIAL_HEALTH
 
     Add-PodeMiddleware -Name 'RateLimiter' -Route '/api/*' -ScriptBlock {
         $maxRequests   = 30    # Max requests per window
