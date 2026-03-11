@@ -69,8 +69,10 @@ function ConvertTo-PipePalResult {
 
     # ── Build summary ─────────────────────────────────────────────────────────
     $summary = [ordered]@{
-        totalCount     = if ($MaesterJson.TotalCount)             { $MaesterJson.TotalCount }
-                         else { $flatTests.Count }
+        totalCount     = ($flatTests | Where-Object { $_.result -eq 'Passed' }).Count +
+                         ($flatTests | Where-Object { $_.result -eq 'Failed' }).Count +
+                         ($flatTests | Where-Object { $_.result -in @('Skipped','NotRun') }).Count +
+                         ($flatTests | Where-Object { $_.result -eq 'Error' }).Count
         passedCount    = if ($MaesterJson.PassedCount)            { $MaesterJson.PassedCount }
                          else { ($flatTests | Where-Object { $_.result -eq 'Passed'  }).Count }
         failedCount    = if ($MaesterJson.FailedCount)            { $MaesterJson.FailedCount }
@@ -80,6 +82,7 @@ function ConvertTo-PipePalResult {
                          } else {
                             ($flatTests | Where-Object { $_.result -in @('Skipped','NotRun') }).Count
                          }
+        errorCount     = ($flatTests | Where-Object { $_.result -eq 'Error'  }).Count
         durationMs     = [math]::Round(($RunEnd - $RunStart).TotalMilliseconds)
         timestamp      = if ($MaesterJson.ExecutedAt) { $MaesterJson.ExecutedAt }
                          else { $RunStart.ToString('o') }
