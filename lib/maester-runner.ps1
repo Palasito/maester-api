@@ -544,6 +544,100 @@ $MaesterRunnerScriptBlock = {
             }
         }
 
+        # ── 9a. Synthesize missing tests as NotRun ────────────────────────────
+        # Some tests defined in maester-config.json are never added to
+        # $maesterJson.Tests by Pester — typically because a required service
+        # connection (Exchange, Teams, Azure) was unavailable, or because Pester
+        # tag-discovery skipped them for a tenant-specific reason.
+        # We load the config and append a synthetic NotRun entry for every
+        # expected test that did not appear in the Pester output, so the
+        # totalCount always equals the full inventory count for the requested suites.
+        #
+        # ID-mismatch guard: Pester occasionally emits a fallback name-based ID
+        # (e.g. "Enable-Conditional-Access-...") for a test whose $test.Id is
+        # null and whose tags don't match the MT.* pattern.  Such a phantom test
+        # would be in $flatTests but absent from the config, causing one extra
+        # NotRun to be synthesised (totalCount = inventoryCount + 1).  We prevent
+        # this by computing notRunToAdd = configExpected - matchedPester so that
+        # phantom Pester tests consume the "slot" of their unidentified config
+        # counterpart, keeping totalCount exactly equal to the inventory count.
+        $mcConfigPath = Join-Path $TestsPath 'maester-config.json'
+        if ($TestsPath -and (Test-Path $mcConfigPath)) {
+            try {
+                $mcConfig = Get-Content $mcConfigPath -Raw | ConvertFrom-Json
+
+                # Suite-ID → test-ID prefix mapping (mirrors inventory-builder.ps1)
+                $suitePrefix = @{
+                    maester = 'MT.'
+                    eidsca  = 'EIDSCA.'
+                    cis     = 'CIS.'
+                    cisa    = 'CISA.'
+                    orca    = 'ORCA.'
+                }
+
+                # Determine which prefixes are in scope for this run
+                $activePrefixes = if ($requestedSuites.Count -gt 0) {
+                    @($requestedSuites |
+                        Where-Object { $suitePrefix.ContainsKey($_) } |
+                        ForEach-Object { $suitePrefix[$_] })
+                } else {
+                    @($suitePrefix.Values)   # all suites → all prefixes
+                }
+
+                # Collect only the in-scope config entries (mirrors inventory count)
+                $inScopeConfigTests = @($mcConfig.TestSettings | Where-Object {
+                    $t = $_
+                    $activePrefixes.Count -eq 0 -or ($activePrefixes | Where-Object { $t.Id.StartsWith($_) })
+                })
+
+                # Build a fast lookup of config IDs (used to check which
+                # config entries are already covered by a Pester result)
+                $configIdSet = [System.Collections.Generic.HashSet[string]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($t in $inScopeConfigTests) { $null = $configIdSet.Add($t.Id) }
+
+                # Build a fast lookup of IDs already present in $flatTests
+                $executedIds = [System.Collections.Generic.HashSet[string]]::new(
+                    [System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($t in $flatTests) { $null = $executedIds.Add($t.id) }
+
+                # Cap NotRun additions to (configExpected - pesterTotal).
+                # A phantom Pester test (fallback name-based ID, not in config) still
+                # occupies a "slot" in totalCount, so budget = configCount - pesterCount
+                # keeps totalCount == inventory count regardless of ID mismatches.
+                # Using (configCount - matchedPesterCount) would give budget=12 when
+                # 1 phantom exists (312 matched + 1 phantom = 313 pester, 12 unmatched
+                # config entries) → totalCount = 313+12 = 325.  Correct formula below.
+                $pesterCountBeforeSynthesis = $flatTests.Count
+                $notRunBudget = [Math]::Max(0, $inScopeConfigTests.Count - $pesterCountBeforeSynthesis)
+                $notRunAdded  = 0
+
+                # Append a NotRun entry for every expected test that Pester missed,
+                # respecting the budget so totalCount == inventory count.
+                foreach ($t in $inScopeConfigTests) {
+                    if ($notRunAdded -ge $notRunBudget) { break }
+                    if (-not $executedIds.Contains($t.Id)) {
+                        $flatTests += [ordered]@{
+                            id           = $t.Id
+                            name         = if ($t.Title)    { $t.Title }    else { $t.Id }
+                            result       = 'NotRun'
+                            duration     = 0
+                            severity     = if ($t.Severity) { $t.Severity } else { 'Info' }
+                            category     = ''
+                            block        = ''
+                            errorRecord  = $null
+                            helpUrl      = $null
+                            resultDetail = $null
+                        }
+                        $notRunAdded++
+                    }
+                }
+                Write-Host "[maester-runner] Synthesized $notRunAdded missing tests as NotRun (budget: $notRunBudget, config: $($inScopeConfigTests.Count), pester: $($executedIds.Count))."
+            } catch {
+                Write-Warning "[maester-runner] Could not synthesize missing tests: $($_.Exception.Message)"
+            }
+        }
+
         # ── 9b. Severity filter (post-run) ────────────────────────────────────
         # Apply severity filtering here rather than via Pester tags (see step 5).
         if ($Severities -and $Severities.Count -gt 0) {
@@ -561,6 +655,7 @@ $MaesterRunnerScriptBlock = {
             passedCount    = ($flatTests | Where-Object { $_.result -eq 'Passed'  }).Count
             failedCount    = ($flatTests | Where-Object { $_.result -eq 'Failed'  }).Count
             skippedCount   = ($flatTests | Where-Object { $_.result -in @('Skipped','NotRun') }).Count
+            errorCount     = ($flatTests | Where-Object { $_.result -eq 'Error'   }).Count
             durationMs     = [math]::Round(($runEnd - $runStart).TotalMilliseconds)
             timestamp      = if ($maesterJson.ExecutedAt) { $maesterJson.ExecutedAt }
                              else { $runStart.ToString('o') }

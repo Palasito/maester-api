@@ -19,7 +19,7 @@ function ConvertTo-PipePalResult {
         [datetime] UTC when the test run finished.
     .OUTPUTS
         [ordered] hashtable matching the PipePal result contract:
-        { totalCount, passedCount, failedCount, skippedCount, durationMs,
+        { totalCount, passedCount, failedCount, skippedCount, errorCount, durationMs,
           timestamp, suitesRun, severityFilter, tests: [ ... ] }
     #>
     param(
@@ -69,10 +69,7 @@ function ConvertTo-PipePalResult {
 
     # ── Build summary ─────────────────────────────────────────────────────────
     $summary = [ordered]@{
-        totalCount     = ($flatTests | Where-Object { $_.result -eq 'Passed' }).Count +
-                         ($flatTests | Where-Object { $_.result -eq 'Failed' }).Count +
-                         ($flatTests | Where-Object { $_.result -in @('Skipped','NotRun') }).Count +
-                         ($flatTests | Where-Object { $_.result -eq 'Error' }).Count
+        totalCount     = $flatTests.Count
         passedCount    = if ($MaesterJson.PassedCount)            { $MaesterJson.PassedCount }
                          else { ($flatTests | Where-Object { $_.result -eq 'Passed'  }).Count }
         failedCount    = if ($MaesterJson.FailedCount)            { $MaesterJson.FailedCount }
@@ -82,7 +79,8 @@ function ConvertTo-PipePalResult {
                          } else {
                             ($flatTests | Where-Object { $_.result -in @('Skipped','NotRun') }).Count
                          }
-        errorCount     = ($flatTests | Where-Object { $_.result -eq 'Error'  }).Count
+        errorCount     = if ($null -ne $MaesterJson.ErrorCount) { $MaesterJson.ErrorCount }
+                         else { ($flatTests | Where-Object { $_.result -eq 'Error'  }).Count }
         durationMs     = [math]::Round(($RunEnd - $RunStart).TotalMilliseconds)
         timestamp      = if ($MaesterJson.ExecutedAt) { $MaesterJson.ExecutedAt }
                          else { $RunStart.ToString('o') }

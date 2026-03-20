@@ -138,6 +138,29 @@ try {
     Write-Host "[server] WARNING: Could not seed health data ($($_.Exception.Message)). Will populate on first timer tick."
 }
 
+# ─── Pre-build initial /health JSON ──────────────────────────────────────────
+# Seed so the first 30 seconds of /health requests return data immediately.
+# ResourceSampler timer rebuilds this every 30 seconds thereafter.
+$INITIAL_HEALTH_JSON = ConvertTo-Json -Depth 4 -Compress -InputObject ([ordered]@{
+    status          = 'ok'
+    uptime          = 0
+    dbConnected     = $INITIAL_HEALTH.dbConnected
+    activeJobs      = $INITIAL_HEALTH.activeJobs
+    cpuPercent      = [double]0
+    cpuAvgPercent   = [double]0
+    ramUsedMB       = [double]0
+    ramTotalMB      = [double]0
+    ramPercent      = [double]0
+    ramAvgMB        = [double]0
+    ramAvgPercent   = [double]0
+    totalCompleted  = $INITIAL_HEALTH.totalCompleted
+    totalFailed     = $INITIAL_HEALTH.totalFailed
+    avgDurationMs   = $INITIAL_HEALTH.avgDurationMs
+    minDurationMs   = $INITIAL_HEALTH.minDurationMs
+    maxDurationMs   = $INITIAL_HEALTH.maxDurationMs
+    lastCompletedAt = $INITIAL_HEALTH.lastCompletedAt
+})
+
 # ─── Start Pode HTTP server ──────────────────────────────────────────────────
 Write-Host '[server] Starting Pode server on port 80...'
 
@@ -213,6 +236,7 @@ Start-PodeServer -Threads 1 {
     # on every request — eliminates dot-sourcing and Import-Module per call.
     # ══════════════════════════════════════════════════════════════════════════
     Set-PodeState -Name 'HealthCache' -Value $INITIAL_HEALTH
+    Set-PodeState -Name 'HealthJson' -Value $INITIAL_HEALTH_JSON
 
     Add-PodeMiddleware -Name 'RateLimiter' -Route '/api/*' -ScriptBlock {
         $maxRequests   = 30    # Max requests per window
@@ -283,7 +307,7 @@ Start-PodeServer -Threads 1 {
     }
 
     Add-PodeTimer -Name 'ResourceSampler' -Interval 30 -ScriptBlock {
-        $dbPath = $using:DB_PATH
+        $startTime = $using:SERVER_START_TIME
         try {
             # ── CPU from /proc/stat ──────────────────────────────────────
             $cpuLine = (Get-Content /proc/stat -TotalCount 1) -replace '^cpu\s+', ''
@@ -313,6 +337,9 @@ Start-PodeServer -Threads 1 {
                 $ramTotalMB = [math]::Round($totalKB / 1024, 1)
                 $ramUsedMB  = [math]::Round(($totalKB - $availKB) / 1024, 1)
             }
+
+            # Capture resource values for JSON building (hashtable ref is visible inside Lock)
+            $captured = @{ cpu = [double]0; cpuAvg = [double]0; ram = [double]0; ramMax = [double]0; ramAvg = [double]0 }
 
             Lock-PodeObject -Name 'ResourceLock' -ScriptBlock {
                 $mon = Get-PodeState -Name 'ResourceMonitor'
@@ -349,50 +376,127 @@ Start-PodeServer -Threads 1 {
                 }
                 $mon.AvgCpuPercent = [math]::Round($sumCpu / $mon.Count, 1)
                 $mon.AvgRamUsedMB  = [math]::Round($sumRam / $mon.Count, 1)
+
+                # Capture current values for JSON pre-build (avoids second lock)
+                $captured.cpu    = $mon.LatestCpuPercent
+                $captured.cpuAvg = $mon.AvgCpuPercent
+                $captured.ram    = $mon.LatestRamUsedMB
+                $captured.ramMax = $mon.LatestRamTotalMB
+                $captured.ramAvg = $mon.AvgRamUsedMB
             }
 
-            # ── Refresh health cache from SQLite ─────────────────────────
-            # Runs once every 30s instead of on every /health request.
-            # This eliminates dot-sourcing db.ps1 and Import-Module from
-            # the hot path (~1 call/s from dashboard polling).
-            try {
-                $row = Invoke-SqliteQuery -DataSource $dbPath -Query "SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'"
-                $statsRow = Invoke-SqliteQuery -DataSource $dbPath -Query @"
-                    SELECT
-                        COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS totalCompleted,
-                        COALESCE(SUM(CASE WHEN status = 'failed'    THEN 1 ELSE 0 END), 0) AS totalFailed,
-                        COALESCE(AVG(CASE WHEN status = 'completed' AND duration_ms > 0
-                                     THEN duration_ms END), 0)                              AS avgDurationMs,
-                        COALESCE(MIN(CASE WHEN status = 'completed' AND duration_ms > 0
-                                     THEN duration_ms END), 0)                              AS minDurationMs,
-                        COALESCE(MAX(CASE WHEN status = 'completed' AND duration_ms > 0
-                                     THEN duration_ms END), 0)                              AS maxDurationMs,
-                        MAX(completed_at)                                                    AS lastCompletedAt
-                    FROM job_stats
-"@
-                Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
-                    $hc = Get-PodeState -Name 'HealthCache'
-                    $hc.dbConnected     = $true
-                    $hc.activeJobs      = [int]$row.cnt
-                    if ($statsRow) {
-                        $hc.totalCompleted  = [int]$statsRow.totalCompleted
-                        $hc.totalFailed     = [int]$statsRow.totalFailed
-                        $hc.avgDurationMs   = [math]::Round([double]$statsRow.avgDurationMs)
-                        $hc.minDurationMs   = [int]$statsRow.minDurationMs
-                        $hc.maxDurationMs   = [int]$statsRow.maxDurationMs
-                        $hc.lastCompletedAt = if ($statsRow.lastCompletedAt) { $statsRow.lastCompletedAt } else { $null }
-                    }
-                }
-            } catch {
-                Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
-                    (Get-PodeState -Name 'HealthCache').dbConnected = $false
-                }
+            # ── Pre-build /health JSON response ──────────────────────────
+            # Eliminates per-request hashtable creation, Lock-PodeObject
+            # closures, and ConvertTo-Json calls on the hot /health path.
+            # Health stats come from HealthCache (refreshed every 5 min by
+            # HealthRefresher timer); CPU/RAM are fresh from above.
+            $dbStats = @{ db = $false; jobs = 0; tc = 0; tf = 0; avg = 0; mn = 0; mx = 0; last = $null }
+            Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
+                $hc = Get-PodeState -Name 'HealthCache'
+                $dbStats.db   = $hc.dbConnected
+                $dbStats.jobs = $hc.activeJobs
+                $dbStats.tc   = $hc.totalCompleted
+                $dbStats.tf   = $hc.totalFailed
+                $dbStats.avg  = $hc.avgDurationMs
+                $dbStats.mn   = $hc.minDurationMs
+                $dbStats.mx   = $hc.maxDurationMs
+                $dbStats.last = $hc.lastCompletedAt
             }
+
+            $uptimeSec  = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
+            $ramPct     = if ($captured.ramMax -gt 0) { [math]::Round(($captured.ram / $captured.ramMax) * 100, 1) } else { 0 }
+            $ramAvgPct  = if ($captured.ramMax -gt 0) { [math]::Round(($captured.ramAvg / $captured.ramMax) * 100, 1) } else { 0 }
+
+            $healthJson = ConvertTo-Json -Depth 4 -Compress -InputObject ([ordered]@{
+                status          = 'ok'
+                uptime          = $uptimeSec
+                dbConnected     = $dbStats.db
+                activeJobs      = $dbStats.jobs
+                cpuPercent      = $captured.cpu
+                cpuAvgPercent   = $captured.cpuAvg
+                ramUsedMB       = $captured.ram
+                ramTotalMB      = $captured.ramMax
+                ramPercent      = $ramPct
+                ramAvgMB        = $captured.ramAvg
+                ramAvgPercent   = $ramAvgPct
+                totalCompleted  = $dbStats.tc
+                totalFailed     = $dbStats.tf
+                avgDurationMs   = $dbStats.avg
+                minDurationMs   = $dbStats.mn
+                maxDurationMs   = $dbStats.mx
+                lastCompletedAt = $dbStats.last
+            })
+
+            Set-PodeState -Name 'HealthJson' -Value $healthJson
         } catch { }
 
-        # Lightweight Gen-0 GC every 30 seconds to collect short-lived objects
-        # created by file reads, SQL queries, and string operations.
-        [System.GC]::Collect(0, [System.GCCollectionMode]::Optimized)
+        # Null out temporary variables so GC sees them as unreachable.
+        # Without this, PowerShell keeps them as live roots on the scope
+        # stack, causing GC to promote them to Gen-1 instead of collecting.
+        $cpuLine = $null; $fields = $null; $idle = $null; $total = $null
+        $ramUsedMB = $null; $ramTotalMB = $null; $memInfo = $null
+        $captured = $null; $dbStats = $null; $healthJson = $null
+
+        # Gen-1 GC: catches objects promoted from Gen-0 during .NET's automatic
+        # collections between our explicit calls. Previous Gen-0-only strategy
+        # failed because objects were still on the stack at GC time → promoted
+        # to Gen-1 → never collected until the 15-minute full GC in JobCleanup.
+        [System.GC]::Collect(1, [System.GCCollectionMode]::Optimized)
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HealthRefresher: Refresh job stats from SQLite every 5 minutes
+    #
+    # MEMORY FIX: SQL queries were previously in ResourceSampler (every 30s),
+    # creating ~46,000 Invoke-SqliteQuery DataTable allocations over 8 days.
+    # Job stats only change when a run completes — 5-minute refresh is ideal
+    # for idle servers and still responsive during active runs.
+    # ══════════════════════════════════════════════════════════════════════════
+    Add-PodeTimer -Name 'HealthRefresher' -Interval 300 -ScriptBlock {
+        $dbPath = $using:DB_PATH
+        try {
+            $row = Invoke-SqliteQuery -DataSource $dbPath -Query "SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'"
+            $statsRow = Invoke-SqliteQuery -DataSource $dbPath -Query @"
+                SELECT
+                    COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS totalCompleted,
+                    COALESCE(SUM(CASE WHEN status = 'failed'    THEN 1 ELSE 0 END), 0) AS totalFailed,
+                    COALESCE(AVG(CASE WHEN status = 'completed' AND duration_ms > 0
+                                 THEN duration_ms END), 0)                              AS avgDurationMs,
+                    COALESCE(MIN(CASE WHEN status = 'completed' AND duration_ms > 0
+                                 THEN duration_ms END), 0)                              AS minDurationMs,
+                    COALESCE(MAX(CASE WHEN status = 'completed' AND duration_ms > 0
+                                 THEN duration_ms END), 0)                              AS maxDurationMs,
+                    MAX(completed_at)                                                    AS lastCompletedAt
+                FROM job_stats
+"@
+            Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
+                $hc = Get-PodeState -Name 'HealthCache'
+                $hc.dbConnected     = $true
+                $hc.activeJobs      = [int]$row.cnt
+                if ($statsRow) {
+                    $hc.totalCompleted  = [int]$statsRow.totalCompleted
+                    $hc.totalFailed     = [int]$statsRow.totalFailed
+                    $hc.avgDurationMs   = [math]::Round([double]$statsRow.avgDurationMs)
+                    $hc.minDurationMs   = [int]$statsRow.minDurationMs
+                    $hc.maxDurationMs   = [int]$statsRow.maxDurationMs
+                    $hc.lastCompletedAt = if ($statsRow.lastCompletedAt) { $statsRow.lastCompletedAt } else { $null }
+                }
+            }
+        } catch {
+            Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
+                (Get-PodeState -Name 'HealthCache').dbConnected = $false
+            }
+        }
+
+        # Null out SQL result objects (DataTable/DataRow) before GC.
+        $row = $null; $statsRow = $null
+
+        # Full GC every 5 minutes: collects all generations including Gen-2
+        # objects that accumulate from Invoke-SqliteQuery DataTable allocations,
+        # Lock-PodeObject closures, and Pode's per-request overhead.
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+        [System.GC]::Collect()
     }
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -705,58 +809,14 @@ setInterval(poll, 15000);
     # operations over 4 days that caused the ~500MB idle memory leak.
     # ══════════════════════════════════════════════════════════════════════════
     Add-PodeRoute -Method Get -Path '/health' -ScriptBlock {
-        $startTime = $using:SERVER_START_TIME
-        $uptimeSec = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
-
-        # Read cached health data (updated every 30s by ResourceSampler timer)
-        $hc = @{}
-        Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
-            $hcState = Get-PodeState -Name 'HealthCache'
-            $hc = @{
-                dbConnected     = $hcState.dbConnected
-                activeJobs      = $hcState.activeJobs
-                totalCompleted  = $hcState.totalCompleted
-                totalFailed     = $hcState.totalFailed
-                avgDurationMs   = $hcState.avgDurationMs
-                minDurationMs   = $hcState.minDurationMs
-                maxDurationMs   = $hcState.maxDurationMs
-                lastCompletedAt = $hcState.lastCompletedAt
-            }
-        }
-
-        # Read cached resource metrics (updated every 30s by ResourceSampler timer)
-        $cpuPercent = 0; $cpuAvgPercent = 0; $ramUsedMB = 0; $ramTotalMB = 0; $ramAvgMB = 0
-        Lock-PodeObject -Name 'ResourceLock' -ScriptBlock {
-            $mon = Get-PodeState -Name 'ResourceMonitor'
-            $cpuPercent    = $mon.LatestCpuPercent
-            $cpuAvgPercent = $mon.AvgCpuPercent
-            $ramUsedMB     = $mon.LatestRamUsedMB
-            $ramTotalMB    = $mon.LatestRamTotalMB
-            $ramAvgMB      = $mon.AvgRamUsedMB
-        }
-
-        $ramPercent    = if ($ramTotalMB -gt 0) { [math]::Round(($ramUsedMB / $ramTotalMB) * 100, 1) } else { 0 }
-        $ramAvgPercent = if ($ramTotalMB -gt 0) { [math]::Round(($ramAvgMB  / $ramTotalMB) * 100, 1) } else { 0 }
-
-        Write-PodeJsonResponse -Value ([ordered]@{
-            status          = 'ok'
-            uptime          = $uptimeSec
-            dbConnected     = $hc.dbConnected
-            activeJobs      = $hc.activeJobs
-            cpuPercent      = $cpuPercent
-            cpuAvgPercent   = $cpuAvgPercent
-            ramUsedMB       = $ramUsedMB
-            ramTotalMB      = $ramTotalMB
-            ramPercent      = $ramPercent
-            ramAvgMB        = $ramAvgMB
-            ramAvgPercent   = $ramAvgPercent
-            totalCompleted  = $hc.totalCompleted
-            totalFailed     = $hc.totalFailed
-            avgDurationMs   = $hc.avgDurationMs
-            minDurationMs   = $hc.minDurationMs
-            maxDurationMs   = $hc.maxDurationMs
-            lastCompletedAt = $hc.lastCompletedAt
-        })
+        # ZERO-ALLOCATION: Serve the pre-built JSON string directly.
+        # The ResourceSampler timer (30s) rebuilds this string with fresh
+        # CPU/RAM metrics + cached DB stats. No hashtable creation, no
+        # Lock-PodeObject closures, no ConvertTo-Json per request.
+        # At 15s polling from dashboard + Azure health probes, this
+        # eliminates ~46K+ object allocations over 8 days.
+        $json = Get-PodeState -Name 'HealthJson'
+        Write-PodeTextResponse -Value $json -ContentType 'application/json'
     }
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1038,8 +1098,6 @@ setInterval(poll, 15000);
         $dbPath       = $using:DB_PATH
         $staleMinutes = $using:JOB_STALE_MINUTES
 
-        Import-Module PSSQLite -ErrorAction SilentlyContinue
-
         try {
             # 1. Mark stale running jobs as failed
             $cutoff = [datetime]::UtcNow.AddMinutes(-$staleMinutes).ToString('o')
@@ -1067,9 +1125,11 @@ setInterval(poll, 15000);
         }
         catch { }
 
-        # 5. Force .NET garbage collection to return reclaimed memory to the OS.
-        # PowerShell does not aggressively GC on its own; this prevents the process
-        # RSS from drifting upward indefinitely on long-running servers.
+        # Null out temporary SQL result variables before GC
+        $cutoff = $null; $now = $null; $hardCutoff = $null
+
+        # 5. Force full GC — collects all generations including Gen-2 objects
+        # from Invoke-SqliteQuery DataTable allocations and Pode request overhead.
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
         [System.GC]::Collect()
