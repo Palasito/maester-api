@@ -304,29 +304,35 @@ Start-PodeServer -Threads 1 {
         LatestRamTotalMB = [double]0
         AvgCpuPercent    = [double]0
         AvgRamUsedMB     = [double]0
+        # Reused across ticks to avoid per-tick allocations
+        CapturedValues   = @{ cpu = [double]0; cpuAvg = [double]0; ram = [double]0; ramMax = [double]0; ramAvg = [double]0 }
+        JsonBuilder      = [System.Text.StringBuilder]::new(512)
     }
 
     Add-PodeTimer -Name 'ResourceSampler' -Interval 30 -ScriptBlock {
         $startTime = $using:SERVER_START_TIME
         try {
-            # ── CPU from /proc/stat ──────────────────────────────────────
-            $cpuLine = (Get-Content /proc/stat -TotalCount 1) -replace '^cpu\s+', ''
-            $fields  = $cpuLine -split '\s+' | ForEach-Object { [long]$_ }
-            $idle    = [long]$fields[3] + [long]$fields[4]
-            $total   = ($fields | Measure-Object -Sum).Sum
+            # ── CPU from /proc/stat (StreamReader avoids Get-Content overhead) ─
+            $sr = [System.IO.StreamReader]::new('/proc/stat')
+            $cpuLine = $sr.ReadLine() -replace '^cpu\s+', ''
+            $sr.Dispose(); $sr = $null
+            $fields = $cpuLine -split '\s+'
+            $idle   = [long]$fields[3] + [long]$fields[4]
+            $total  = [long]0
+            foreach ($f in $fields) { $total += [long]$f }
 
-            # ── RAM from cgroup (v2 → v1 → /proc/meminfo fallback) ──────
-            $ramUsedMB = 0; $ramTotalMB = 0
+            # ── RAM from cgroup (File I/O avoids Get-Content cmdlet overhead) ─
+            $ramUsedMB = [double]0; $ramTotalMB = [double]0
             if (Test-Path '/sys/fs/cgroup/memory.current') {
                 # cgroup v2
-                $ramUsedMB  = [math]::Round([long](Get-Content '/sys/fs/cgroup/memory.current') / 1MB, 1)
-                $maxRaw     = (Get-Content '/sys/fs/cgroup/memory.max').Trim()
+                $ramUsedMB  = [math]::Round([long]([System.IO.File]::ReadAllText('/sys/fs/cgroup/memory.current').Trim()) / 1MB, 1)
+                $maxRaw     = [System.IO.File]::ReadAllText('/sys/fs/cgroup/memory.max').Trim()
                 $ramTotalMB = if ($maxRaw -eq 'max') { 0 } else { [math]::Round([long]$maxRaw / 1MB, 1) }
             }
             elseif (Test-Path '/sys/fs/cgroup/memory/memory.usage_in_bytes') {
                 # cgroup v1
-                $ramUsedMB  = [math]::Round([long](Get-Content '/sys/fs/cgroup/memory/memory.usage_in_bytes') / 1MB, 1)
-                $limitRaw   = (Get-Content '/sys/fs/cgroup/memory/memory.limit_in_bytes').Trim()
+                $ramUsedMB  = [math]::Round([long]([System.IO.File]::ReadAllText('/sys/fs/cgroup/memory/memory.usage_in_bytes').Trim()) / 1MB, 1)
+                $limitRaw   = [System.IO.File]::ReadAllText('/sys/fs/cgroup/memory/memory.limit_in_bytes').Trim()
                 $ramTotalMB = if ([long]$limitRaw -gt 1TB) { 0 } else { [math]::Round([long]$limitRaw / 1MB, 1) }
             }
             else {
@@ -338,104 +344,102 @@ Start-PodeServer -Threads 1 {
                 $ramUsedMB  = [math]::Round(($totalKB - $availKB) / 1024, 1)
             }
 
-            # Capture resource values for JSON building (hashtable ref is visible inside Lock)
-            $captured = @{ cpu = [double]0; cpuAvg = [double]0; ram = [double]0; ramMax = [double]0; ramAvg = [double]0 }
+            # Reuse persistent CapturedValues hashtable from PodeState (zero allocation)
+            $captured = (Get-PodeState -Name 'ResourceMonitor').CapturedValues
 
-            Lock-PodeObject -Name 'ResourceLock' -ScriptBlock {
-                $mon = Get-PodeState -Name 'ResourceMonitor'
+            # LOCK-FREE: Single writer (this timer) + dashboard reader with -Threads 1.
+            # Lock-PodeObject creates a closure allocation per tick (2880/day).
+            # Worst case without lock: dashboard shows slightly stale gauge values.
+            $mon = Get-PodeState -Name 'ResourceMonitor'
 
-                $idleDelta  = $idle  - $mon.LastCpuIdle
-                $totalDelta = $total - $mon.LastCpuTotal
-                $cpuPercent = if ($totalDelta -gt 0) {
-                    [math]::Round((1 - ($idleDelta / $totalDelta)) * 100, 1)
-                } else { 0 }
+            $idleDelta  = $idle  - $mon.LastCpuIdle
+            $totalDelta = $total - $mon.LastCpuTotal
+            $cpuPercent = if ($totalDelta -gt 0) {
+                [math]::Round((1 - ($idleDelta / $totalDelta)) * 100, 1)
+            } else { 0 }
 
-                $mon.LastCpuIdle  = $idle
-                $mon.LastCpuTotal = $total
+            $mon.LastCpuIdle  = $idle
+            $mon.LastCpuTotal = $total
 
-                # Write to circular buffer (no RemoveAt, no array copy)
+            # Reuse circular buffer sample in-place (zero allocation after first 120)
+            $sample = $mon.Samples[$mon.WriteIndex]
+            if ($null -eq $sample) {
                 $mon.Samples[$mon.WriteIndex] = @{
                     Cpu    = [double]$cpuPercent
                     Ram    = [double]$ramUsedMB
                     RamMax = [double]$ramTotalMB
                 }
-                $mon.WriteIndex = ($mon.WriteIndex + 1) % 120
-                if ($mon.Count -lt 120) { $mon.Count++ }
-
-                # Store latest snapshot for fast reads
-                $mon.LatestCpuPercent = [double]$cpuPercent
-                $mon.LatestRamUsedMB  = [double]$ramUsedMB
-                $mon.LatestRamTotalMB = [double]$ramTotalMB
-
-                # Compute rolling averages from buffer
-                $sumCpu = [double]0; $sumRam = [double]0
-                for ($i = 0; $i -lt $mon.Count; $i++) {
-                    $s = $mon.Samples[$i]
-                    $sumCpu += $s.Cpu
-                    $sumRam += $s.Ram
-                }
-                $mon.AvgCpuPercent = [math]::Round($sumCpu / $mon.Count, 1)
-                $mon.AvgRamUsedMB  = [math]::Round($sumRam / $mon.Count, 1)
-
-                # Capture current values for JSON pre-build (avoids second lock)
-                $captured.cpu    = $mon.LatestCpuPercent
-                $captured.cpuAvg = $mon.AvgCpuPercent
-                $captured.ram    = $mon.LatestRamUsedMB
-                $captured.ramMax = $mon.LatestRamTotalMB
-                $captured.ramAvg = $mon.AvgRamUsedMB
+            } else {
+                $sample.Cpu    = [double]$cpuPercent
+                $sample.Ram    = [double]$ramUsedMB
+                $sample.RamMax = [double]$ramTotalMB
             }
+            $mon.WriteIndex = ($mon.WriteIndex + 1) % 120
+            if ($mon.Count -lt 120) { $mon.Count++ }
 
-            # ── Pre-build /health JSON response ──────────────────────────
-            # Eliminates per-request hashtable creation, Lock-PodeObject
-            # closures, and ConvertTo-Json calls on the hot /health path.
-            # Health stats come from HealthCache (refreshed every 5 min by
-            # HealthRefresher timer); CPU/RAM are fresh from above.
-            $dbStats = @{ db = $false; jobs = 0; tc = 0; tf = 0; avg = 0; mn = 0; mx = 0; last = $null }
-            Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
-                $hc = Get-PodeState -Name 'HealthCache'
-                $dbStats.db   = $hc.dbConnected
-                $dbStats.jobs = $hc.activeJobs
-                $dbStats.tc   = $hc.totalCompleted
-                $dbStats.tf   = $hc.totalFailed
-                $dbStats.avg  = $hc.avgDurationMs
-                $dbStats.mn   = $hc.minDurationMs
-                $dbStats.mx   = $hc.maxDurationMs
-                $dbStats.last = $hc.lastCompletedAt
+            # Store latest snapshot for fast reads
+            $mon.LatestCpuPercent = [double]$cpuPercent
+            $mon.LatestRamUsedMB  = [double]$ramUsedMB
+            $mon.LatestRamTotalMB = [double]$ramTotalMB
+
+            # Compute rolling averages from buffer
+            $sumCpu = [double]0; $sumRam = [double]0
+            for ($i = 0; $i -lt $mon.Count; $i++) {
+                $s = $mon.Samples[$i]
+                $sumCpu += $s.Cpu
+                $sumRam += $s.Ram
             }
+            $mon.AvgCpuPercent = [math]::Round($sumCpu / $mon.Count, 1)
+            $mon.AvgRamUsedMB  = [math]::Round($sumRam / $mon.Count, 1)
 
-            $uptimeSec  = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
-            $ramPct     = if ($captured.ramMax -gt 0) { [math]::Round(($captured.ram / $captured.ramMax) * 100, 1) } else { 0 }
-            $ramAvgPct  = if ($captured.ramMax -gt 0) { [math]::Round(($captured.ramAvg / $captured.ramMax) * 100, 1) } else { 0 }
+            # Copy to persistent hashtable
+            $captured.cpu    = $mon.LatestCpuPercent
+            $captured.cpuAvg = $mon.AvgCpuPercent
+            $captured.ram    = $mon.LatestRamUsedMB
+            $captured.ramMax = $mon.LatestRamTotalMB
+            $captured.ramAvg = $mon.AvgRamUsedMB
 
-            $healthJson = ConvertTo-Json -Depth 4 -Compress -InputObject ([ordered]@{
-                status          = 'ok'
-                uptime          = $uptimeSec
-                dbConnected     = $dbStats.db
-                activeJobs      = $dbStats.jobs
-                cpuPercent      = $captured.cpu
-                cpuAvgPercent   = $captured.cpuAvg
-                ramUsedMB       = $captured.ram
-                ramTotalMB      = $captured.ramMax
-                ramPercent      = $ramPct
-                ramAvgMB        = $captured.ramAvg
-                ramAvgPercent   = $ramAvgPct
-                totalCompleted  = $dbStats.tc
-                totalFailed     = $dbStats.tf
-                avgDurationMs   = $dbStats.avg
-                minDurationMs   = $dbStats.mn
-                maxDurationMs   = $dbStats.mx
-                lastCompletedAt = $dbStats.last
-            })
+            # ── Pre-build /health JSON with reusable StringBuilder ────────
+            # MEMORY FIX: Eliminates ConvertTo-Json + OrderedDictionary per tick.
+            # ConvertTo-Json creates ~30 KB of transient .NET objects per call
+            # (PSObject wrappers, JsonWriter, internal StringBuilder). Over 2880
+            # ticks/day, a fraction get promoted to Gen-2 before our Gen-1 GC,
+            # causing monotonic RSS growth (~100 MB/day). StringBuilder.Append
+            # creates zero intermediate objects; the builder is reused across ticks.
+            $hc  = Get-PodeState -Name 'HealthCache'
+            $inv = [System.Globalization.CultureInfo]::InvariantCulture
+            $uptimeSec = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
+            $ramPct    = if ($captured.ramMax -gt 0) { [math]::Round(($captured.ram / $captured.ramMax) * 100, 1) } else { [double]0 }
+            $ramAvgPct = if ($captured.ramMax -gt 0) { [math]::Round(($captured.ramAvg / $captured.ramMax) * 100, 1) } else { [double]0 }
+            $dbBool    = if ($hc.dbConnected) { 'true' } else { 'false' }
+            $lastVal   = if ($hc.lastCompletedAt) { '"' + $hc.lastCompletedAt + '"' } else { 'null' }
 
-            Set-PodeState -Name 'HealthJson' -Value $healthJson
+            $sb = (Get-PodeState -Name 'ResourceMonitor').JsonBuilder
+            $null = $sb.Clear()
+            $null = $sb.Append('{"status":"ok","uptime":').Append($uptimeSec)
+            $null = $sb.Append(',"dbConnected":').Append($dbBool)
+            $null = $sb.Append(',"activeJobs":').Append([int]$hc.activeJobs)
+            $null = $sb.Append(',"cpuPercent":').Append($captured.cpu.ToString($inv))
+            $null = $sb.Append(',"cpuAvgPercent":').Append($captured.cpuAvg.ToString($inv))
+            $null = $sb.Append(',"ramUsedMB":').Append($captured.ram.ToString($inv))
+            $null = $sb.Append(',"ramTotalMB":').Append($captured.ramMax.ToString($inv))
+            $null = $sb.Append(',"ramPercent":').Append($ramPct.ToString($inv))
+            $null = $sb.Append(',"ramAvgMB":').Append($captured.ramAvg.ToString($inv))
+            $null = $sb.Append(',"ramAvgPercent":').Append($ramAvgPct.ToString($inv))
+            $null = $sb.Append(',"totalCompleted":').Append([int]$hc.totalCompleted)
+            $null = $sb.Append(',"totalFailed":').Append([int]$hc.totalFailed)
+            $null = $sb.Append(',"avgDurationMs":').Append([int]$hc.avgDurationMs)
+            $null = $sb.Append(',"minDurationMs":').Append([int]$hc.minDurationMs)
+            $null = $sb.Append(',"maxDurationMs":').Append([int]$hc.maxDurationMs)
+            $null = $sb.Append(',"lastCompletedAt":').Append($lastVal).Append('}')
+
+            Set-PodeState -Name 'HealthJson' -Value $sb.ToString()
         } catch { }
 
         # Null out temporary variables so GC sees them as unreachable.
-        # Without this, PowerShell keeps them as live roots on the scope
-        # stack, causing GC to promote them to Gen-1 instead of collecting.
         $cpuLine = $null; $fields = $null; $idle = $null; $total = $null
         $ramUsedMB = $null; $ramTotalMB = $null; $memInfo = $null
-        $captured = $null; $dbStats = $null; $healthJson = $null
+        $captured = $null; $hc = $null; $sb = $null; $inv = $null
 
         # Gen-1 GC: catches objects promoted from Gen-0 during .NET's automatic
         # collections between our explicit calls. Previous Gen-0-only strategy
@@ -469,34 +473,33 @@ Start-PodeServer -Threads 1 {
                     MAX(completed_at)                                                    AS lastCompletedAt
                 FROM job_stats
 "@
-            Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
-                $hc = Get-PodeState -Name 'HealthCache'
-                $hc.dbConnected     = $true
-                $hc.activeJobs      = [int]$row.cnt
-                if ($statsRow) {
-                    $hc.totalCompleted  = [int]$statsRow.totalCompleted
-                    $hc.totalFailed     = [int]$statsRow.totalFailed
-                    $hc.avgDurationMs   = [math]::Round([double]$statsRow.avgDurationMs)
-                    $hc.minDurationMs   = [int]$statsRow.minDurationMs
-                    $hc.maxDurationMs   = [int]$statsRow.maxDurationMs
-                    $hc.lastCompletedAt = if ($statsRow.lastCompletedAt) { $statsRow.lastCompletedAt } else { $null }
-                }
+            # LOCK-FREE: HealthCache is [hashtable]::Synchronized — per-key writes are atomic.
+            # Eliminates 2 Lock-PodeObject closure allocations per 5-min tick.
+            $hc = Get-PodeState -Name 'HealthCache'
+            $hc.dbConnected     = $true
+            $hc.activeJobs      = [int]$row.cnt
+            if ($statsRow) {
+                $hc.totalCompleted  = [int]$statsRow.totalCompleted
+                $hc.totalFailed     = [int]$statsRow.totalFailed
+                $hc.avgDurationMs   = [math]::Round([double]$statsRow.avgDurationMs)
+                $hc.minDurationMs   = [int]$statsRow.minDurationMs
+                $hc.maxDurationMs   = [int]$statsRow.maxDurationMs
+                $hc.lastCompletedAt = if ($statsRow.lastCompletedAt) { $statsRow.lastCompletedAt } else { $null }
             }
         } catch {
-            Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
-                (Get-PodeState -Name 'HealthCache').dbConnected = $false
-            }
+            (Get-PodeState -Name 'HealthCache').dbConnected = $false
         }
 
         # Null out SQL result objects (DataTable/DataRow) before GC.
         $row = $null; $statsRow = $null
 
-        # Full GC every 5 minutes: collects all generations including Gen-2
-        # objects that accumulate from Invoke-SqliteQuery DataTable allocations,
-        # Lock-PodeObject closures, and Pode's per-request overhead.
-        [System.GC]::Collect()
+        # Aggressive GC every 5 min: collects all generations, compacts LOH,
+        # and returns freed pages to the OS. Standard GC.Collect() frees objects
+        # but may not decommit memory — causing monotonic RSS growth in containers.
+        [System.Runtime.GCSettings]::LargeObjectHeapCompactionMode = [System.Runtime.GCLargeObjectHeapCompactionMode]::CompactOnce
+        [System.GC]::Collect(2, [System.GCCollectionMode]::Aggressive, $true, $true)
         [System.GC]::WaitForPendingFinalizers()
-        [System.GC]::Collect()
+        [System.GC]::Collect(2, [System.GCCollectionMode]::Aggressive, $true, $true)
     }
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -525,31 +528,26 @@ Start-PodeServer -Threads 1 {
     Add-PodeRoute -Method Get -Path '/' -ScriptBlock {
         $startTime = $using:SERVER_START_TIME
 
-        # Read cached health data
-        $hc = @{}
-        Lock-PodeObject -Name 'HealthCacheLock' -ScriptBlock {
-            $hcState = Get-PodeState -Name 'HealthCache'
-            $hc = @{
-                dbConnected     = $hcState.dbConnected
-                activeJobs      = $hcState.activeJobs
-                totalCompleted  = $hcState.totalCompleted
-                totalFailed     = $hcState.totalFailed
-                avgDurationMs   = $hcState.avgDurationMs
-                minDurationMs   = $hcState.minDurationMs
-                maxDurationMs   = $hcState.maxDurationMs
-                lastCompletedAt = $hcState.lastCompletedAt
-            }
-        }
+        # Read cached health data — no lock needed, HealthCache is [hashtable]::Synchronized
+        $hcState = Get-PodeState -Name 'HealthCache'
+        $dbOkRead       = $hcState.dbConnected
+        $activeJobsRead = $hcState.activeJobs
+        $completedRead  = $hcState.totalCompleted
+        $failedRead     = $hcState.totalFailed
+        $avgMsRead      = $hcState.avgDurationMs
+        $minMsRead      = $hcState.minDurationMs
+        $maxMsRead      = $hcState.maxDurationMs
+        $lastRunRead    = $hcState.lastCompletedAt
 
-        $dbOk       = $hc.dbConnected
-        $activeJobs = $hc.activeJobs
-        $completed  = $hc.totalCompleted
-        $failed     = $hc.totalFailed
+        $dbOk       = $dbOkRead
+        $activeJobs = $activeJobsRead
+        $completed  = $completedRead
+        $failed     = $failedRead
         $totalRuns  = $completed + $failed
-        $avgMs      = $hc.avgDurationMs
-        $minMs      = $hc.minDurationMs
-        $maxMs      = $hc.maxDurationMs
-        $lastRun    = if ($hc.lastCompletedAt) { $hc.lastCompletedAt } else { 'N/A' }
+        $avgMs      = $avgMsRead
+        $minMs      = $minMsRead
+        $maxMs      = $maxMsRead
+        $lastRun    = if ($lastRunRead) { $lastRunRead } else { 'N/A' }
         $successRate = if ($totalRuns -gt 0) { [math]::Round(($completed / $totalRuns) * 100, 1) } else { 0 }
 
         $uptimeSec  = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
@@ -572,24 +570,21 @@ Start-PodeServer -Threads 1 {
         $minStr = Format-Duration $minMs
         $maxStr = Format-Duration $maxMs
 
-        # ── Resource metrics from cached state ────────────────────────────
-        $res = @{ cpuPercent = 0; cpuAvgPercent = 0; ramUsedMB = 0; ramTotalMB = 0; ramAvgMB = 0 }
-        Lock-PodeObject -Name 'ResourceLock' -ScriptBlock {
-            $mon = Get-PodeState -Name 'ResourceMonitor'
-            $res.cpuPercent    = $mon.LatestCpuPercent
-            $res.cpuAvgPercent = $mon.AvgCpuPercent
-            $res.ramUsedMB     = $mon.LatestRamUsedMB
-            $res.ramTotalMB    = $mon.LatestRamTotalMB
-            $res.ramAvgMB      = $mon.AvgRamUsedMB
-        }
-        $ramPercent    = if ($res.ramTotalMB -gt 0) { [math]::Round(($res.ramUsedMB / $res.ramTotalMB) * 100, 1) } else { 0 }
-        $ramAvgPercent = if ($res.ramTotalMB -gt 0) { [math]::Round(($res.ramAvgMB  / $res.ramTotalMB) * 100, 1) } else { 0 }
-        $cpuColor  = if ($res.cpuPercent -ge 80) { 'status-error' } elseif ($res.cpuPercent -ge 50) { 'status-warn' } else { 'status-ok' }
-        $cpuBar    = if ($res.cpuPercent -ge 80) { 'bar-red' }    elseif ($res.cpuPercent -ge 50) { 'bar-yellow' } else { 'bar-green' }
+        # ── Resource metrics from cached state (lock-free, single writer) ──
+        $mon = Get-PodeState -Name 'ResourceMonitor'
+        $resCpu    = $mon.LatestCpuPercent
+        $resCpuAvg = $mon.AvgCpuPercent
+        $resRam    = $mon.LatestRamUsedMB
+        $resRamMax = $mon.LatestRamTotalMB
+        $resRamAvg = $mon.AvgRamUsedMB
+        $ramPercent    = if ($resRamMax -gt 0) { [math]::Round(($resRam / $resRamMax) * 100, 1) } else { 0 }
+        $ramAvgPercent = if ($resRamMax -gt 0) { [math]::Round(($resRamAvg  / $resRamMax) * 100, 1) } else { 0 }
+        $cpuColor  = if ($resCpu -ge 80) { 'status-error' } elseif ($resCpu -ge 50) { 'status-warn' } else { 'status-ok' }
+        $cpuBar    = if ($resCpu -ge 80) { 'bar-red' }    elseif ($resCpu -ge 50) { 'bar-yellow' } else { 'bar-green' }
         $ramColor  = if ($ramPercent -ge 85) { 'status-error' }    elseif ($ramPercent -ge 60) { 'status-warn' } else { 'status-ok' }
         $ramBar    = if ($ramPercent -ge 85) { 'bar-red' }         elseif ($ramPercent -ge 60) { 'bar-yellow' } else { 'bar-green' }
-        $ramOfStr  = if ($res.ramTotalMB -gt 0) { "of $($res.ramTotalMB) MB (${ramPercent}%)" } else { '(no limit set)' }
-        $ramAvgSub = if ($res.ramTotalMB -gt 0) { "${ramAvgPercent}% &middot; Rolling 1-hour" } else { 'Rolling 1-hour window' }
+        $ramOfStr  = if ($resRamMax -gt 0) { "of $($resRamMax) MB (${ramPercent}%)" } else { '(no limit set)' }
+        $ramAvgSub = if ($resRamMax -gt 0) { "${ramAvgPercent}% &middot; Rolling 1-hour" } else { 'Rolling 1-hour window' }
 
         $html = @"
 <!DOCTYPE html>
@@ -706,19 +701,19 @@ Start-PodeServer -Threads 1 {
     <div class="grid">
         <div class="card">
             <div class="label">CPU Current</div>
-            <div class="value $cpuColor" id="cpu-current-val">$($res.cpuPercent)%</div>
+            <div class="value $cpuColor" id="cpu-current-val">$($resCpu)%</div>
             <div class="bar-container">
-                <div class="bar-fill $cpuBar" id="cpu-current-bar" style="width: $($res.cpuPercent)%"></div>
+                <div class="bar-fill $cpuBar" id="cpu-current-bar" style="width: $($resCpu)%"></div>
             </div>
         </div>
         <div class="card">
             <div class="label">CPU Average</div>
-            <div class="value" id="cpu-avg-val">$($res.cpuAvgPercent)%</div>
+            <div class="value" id="cpu-avg-val">$($resCpuAvg)%</div>
             <div class="sub">Rolling 1-hour window</div>
         </div>
         <div class="card">
             <div class="label">RAM Used</div>
-            <div class="value $ramColor" id="ram-used-val">$($res.ramUsedMB) MB</div>
+            <div class="value $ramColor" id="ram-used-val">$($resRam) MB</div>
             <div class="sub" id="ram-used-sub">$ramOfStr</div>
             <div class="bar-container">
                 <div class="bar-fill $ramBar" id="ram-used-bar" style="width: ${ramPercent}%"></div>
@@ -726,7 +721,7 @@ Start-PodeServer -Threads 1 {
         </div>
         <div class="card">
             <div class="label">RAM Average</div>
-            <div class="value" id="ram-avg-val">$($res.ramAvgMB) MB</div>
+            <div class="value" id="ram-avg-val">$($resRamAvg) MB</div>
             <div class="sub" id="ram-avg-sub">$ramAvgSub</div>
         </div>
     </div>
@@ -790,7 +785,7 @@ function poll() {
     }).catch(function() { setText('last-updated', 'Poll failed — retrying…'); });
 }
 poll();
-setInterval(poll, 15000);
+setInterval(poll, 30000);
 </script>
 </body>
 </html>
@@ -817,6 +812,24 @@ setInterval(poll, 15000);
         # eliminates ~46K+ object allocations over 8 days.
         $json = Get-PodeState -Name 'HealthJson'
         Write-PodeTextResponse -Value $json -ContentType 'application/json'
+    }
+
+    # GET /diag — GC diagnostics (temporary, remove after memory investigation)
+    Add-PodeRoute -Method Get -Path '/diag' -ScriptBlock {
+        $info = [System.GC]::GetGCMemoryInfo()
+        $diag = @{
+            managedHeapMB   = [math]::Round([System.GC]::GetTotalMemory($false) / 1MB, 2)
+            gen0Collections = [System.GC]::CollectionCount(0)
+            gen1Collections = [System.GC]::CollectionCount(1)
+            gen2Collections = [System.GC]::CollectionCount(2)
+            heapSizeMB      = [math]::Round($info.HeapSizeBytes / 1MB, 2)
+            committedMB     = [math]::Round($info.TotalCommittedBytes / 1MB, 2)
+            fragmentedMB    = [math]::Round($info.FragmentedBytes / 1MB, 2)
+            pinnedObjects   = $info.PinnedObjectsCount
+            finalizePending = $info.FinalizationPendingCount
+            pauseDurationsMs = @($info.PauseDurations | ForEach-Object { [math]::Round($_.TotalMilliseconds, 1) })
+        }
+        Write-PodeJsonResponse -Value $diag
     }
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1128,10 +1141,10 @@ setInterval(poll, 15000);
         # Null out temporary SQL result variables before GC
         $cutoff = $null; $now = $null; $hardCutoff = $null
 
-        # 5. Force full GC — collects all generations including Gen-2 objects
-        # from Invoke-SqliteQuery DataTable allocations and Pode request overhead.
-        [System.GC]::Collect()
+        # 5. Aggressive GC — collects all generations, compacts LOH, returns memory to OS.
+        [System.Runtime.GCSettings]::LargeObjectHeapCompactionMode = [System.Runtime.GCLargeObjectHeapCompactionMode]::CompactOnce
+        [System.GC]::Collect(2, [System.GCCollectionMode]::Aggressive, $true, $true)
         [System.GC]::WaitForPendingFinalizers()
-        [System.GC]::Collect()
+        [System.GC]::Collect(2, [System.GCCollectionMode]::Aggressive, $true, $true)
     }
 }

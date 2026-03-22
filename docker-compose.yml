@@ -16,6 +16,8 @@ services:
       - MAESTER_API_KEY=${MAESTER_API_KEY:?MAESTER_API_KEY is required - set it in .env}
       # SQLite stored in app-owned directory (not world-readable /tmp)
       - MAESTER_DB_PATH=/app/data/maester.db
+      # .NET GC: aggressively return memory to OS (1-9, higher = more aggressive)
+      - DOTNET_GCConserveMemory=7
     # volumes:
     #   - maester-data:/data     # Uncomment for persistent DB across restarts
     restart: unless-stopped
