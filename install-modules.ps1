@@ -37,7 +37,6 @@ $modules = @(
     'ExchangeOnlineManagement'
     'MicrosoftTeams'
     'Az.Accounts'
-    'PSSQLite'
     'Maester'
 )
 

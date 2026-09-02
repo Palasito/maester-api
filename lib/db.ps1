@@ -1,14 +1,103 @@
 # lib/db.ps1 — SQLite data access helpers for Maester job persistence
 #
-# All database operations go through this module. Uses PSSQLite for
-# parameterised queries (SQL-injection safe) against a file-based
-# SQLite database with WAL mode for concurrent read/write safety.
+# All database operations go through this module. Uses raw ADO.NET
+# (Microsoft.Data.Sqlite) with proper try/finally/Dispose for every
+# Connection, Command, and DataReader — eliminates the disposal
+# deficiency in PSSQLite that promoted objects to Gen2 and caused
+# ~0.2 MB/hour of unnecessary memory retention.
+#
+# Microsoft.Data.Sqlite + SQLitePCLRaw replaces PSSQLite's
+# System.Data.SQLite which required a Windows-only native interop DLL.
 #
 # ─── Usage ───────────────────────────────────────────────────────
 # . /app/lib/db.ps1                         # dot-source in server.ps1
 # Initialize-MaesterDb -DbPath $DB_PATH     # create table + WAL mode
 # New-MaesterJob -DbPath $DB_PATH -JobId $id -Suites @('maester') -Severity @('High')
 # ─────────────────────────────────────────────────────────────────
+
+# ── Load Microsoft.Data.Sqlite + SQLitePCLRaw assemblies ─────────────────────
+$_sqliteLibDir = '/app/sqlite-libs'
+
+# Register assembly resolver so cross-references between packages are found.
+[System.AppDomain]::CurrentDomain.add_AssemblyResolve({
+    param($sender, $resolveArgs)
+    $name = [System.Reflection.AssemblyName]::new($resolveArgs.Name).Name
+    $path = [System.IO.Path]::Combine('/app/sqlite-libs', "$name.dll")
+    if ([System.IO.File]::Exists($path)) {
+        return [System.Reflection.Assembly]::LoadFrom($path)
+    }
+    return $null
+})
+
+# Load assemblies in dependency order.
+@(
+    'SQLitePCLRaw.core.dll'
+    'SQLitePCLRaw.provider.e_sqlite3.dll'
+    'SQLitePCLRaw.batteries_v2.dll'
+    'Microsoft.Data.Sqlite.dll'
+) | ForEach-Object {
+    $p = [System.IO.Path]::Combine($_sqliteLibDir, $_)
+    [System.Reflection.Assembly]::LoadFrom($p) | Out-Null
+}
+
+# Initialise native SQLite binding (must happen once before any connection).
+[SQLitePCL.Batteries_V2]::Init()
+
+# ── Internal: Execute a parameterised query with full Dispose ─────────────────
+function Invoke-MaesterSql {
+    <#
+    .SYNOPSIS  Execute a SQL query against SQLite with proper ADO.NET disposal.
+               Returns PSObjects for SELECT queries, nothing for DML.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$DbPath,
+        [Parameter(Mandatory)][string]$Query,
+        [hashtable]$Parameters
+    )
+
+    $connStr  = "Data Source=$DbPath"
+    $conn     = $null
+    $cmd      = $null
+    $reader   = $null
+    $isSelect = $Query.TrimStart().StartsWith('SELECT', [System.StringComparison]::OrdinalIgnoreCase) -or
+                $Query.TrimStart().StartsWith('PRAGMA',  [System.StringComparison]::OrdinalIgnoreCase)
+    try {
+        $conn = [Microsoft.Data.Sqlite.SqliteConnection]::new($connStr)
+        $conn.Open()
+
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = $Query
+
+        if ($Parameters) {
+            foreach ($kv in $Parameters.GetEnumerator()) {
+                if ($null -ne $kv.Value) {
+                    $val = $kv.Value
+                    if ($val -is [datetime]) { $val = $val.ToString('yyyy-MM-dd HH:mm:ss') }
+                    $null = $cmd.Parameters.AddWithValue("@$($kv.Key)", $val)
+                } else {
+                    $null = $cmd.Parameters.AddWithValue("@$($kv.Key)", [DBNull]::Value)
+                }
+            }
+        }
+
+        if ($isSelect) {
+            $reader = $cmd.ExecuteReader()
+            while ($reader.Read()) {
+                $obj = [ordered]@{}
+                for ($i = 0; $i -lt $reader.FieldCount; $i++) {
+                    $obj[$reader.GetName($i)] = if ($reader.IsDBNull($i)) { $null } else { $reader.GetValue($i) }
+                }
+                [PSCustomObject]$obj
+            }
+        } else {
+            $null = $cmd.ExecuteNonQuery()
+        }
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if ($cmd)    { $cmd.Dispose() }
+        if ($conn)   { $conn.Dispose() }
+    }
+}
 
 # ── Initialise database & schema ──────────────────────────────────────────────
 
@@ -18,7 +107,7 @@ function Initialize-MaesterDb {
     #>
     param([Parameter(Mandatory)][string]$DbPath)
 
-    Invoke-SqliteQuery -DataSource $DbPath -Query @"
+    Invoke-MaesterSql -DbPath $DbPath -Query @"
         CREATE TABLE IF NOT EXISTS jobs (
             job_id       TEXT    PRIMARY KEY,
             status       TEXT    NOT NULL DEFAULT 'running',
@@ -35,13 +124,13 @@ function Initialize-MaesterDb {
 
     # Migrate existing databases that pre-date the tenant_id column
     try {
-        Invoke-SqliteQuery -DataSource $DbPath -Query 'ALTER TABLE jobs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT "";' -ErrorAction Stop
+        Invoke-MaesterSql -DbPath $DbPath -Query 'ALTER TABLE jobs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT "";'
     } catch {
         # Column already exists — safe to ignore
     }
 
     # Persistent statistics table — survives job deletion
-    Invoke-SqliteQuery -DataSource $DbPath -Query @"
+    Invoke-MaesterSql -DbPath $DbPath -Query @"
         CREATE TABLE IF NOT EXISTS job_stats (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             job_id        TEXT    NOT NULL,
@@ -53,9 +142,9 @@ function Initialize-MaesterDb {
 "@
 
     # WAL mode: concurrent readers + single writer, non-blocking reads
-    Invoke-SqliteQuery -DataSource $DbPath -Query 'PRAGMA journal_mode=WAL;'
+    Invoke-MaesterSql -DbPath $DbPath -Query 'PRAGMA journal_mode=WAL;'
     # Wait up to 5 s for a write lock instead of failing immediately
-    Invoke-SqliteQuery -DataSource $DbPath -Query 'PRAGMA busy_timeout=5000;'
+    Invoke-MaesterSql -DbPath $DbPath -Query 'PRAGMA busy_timeout=5000;'
 }
 
 # ── CRUD operations ───────────────────────────────────────────────────────────
@@ -72,10 +161,10 @@ function New-MaesterJob {
     )
 
     $now = [datetime]::UtcNow.ToString('o')
-    Invoke-SqliteQuery -DataSource $DbPath -Query @"
+    Invoke-MaesterSql -DbPath $DbPath -Query @"
         INSERT INTO jobs (job_id, status, created_at, updated_at, suites, severity)
         VALUES (@jobId, 'running', @now, @now, @suites, @severity)
-"@ -SqlParameters @{
+"@ -Parameters @{
         jobId    = $JobId
         now      = $now
         suites   = ($Suites   | ConvertTo-Json -Compress)
@@ -92,9 +181,9 @@ function Get-MaesterJob {
         [Parameter(Mandatory)][string] $JobId
     )
 
-    Invoke-SqliteQuery -DataSource $DbPath -Query @"
+    Invoke-MaesterSql -DbPath $DbPath -Query @"
         SELECT * FROM jobs WHERE job_id = @jobId
-"@ -SqlParameters @{ jobId = $JobId }
+"@ -Parameters @{ jobId = $JobId }
 }
 
 function Update-MaesterJob {
@@ -111,7 +200,7 @@ function Update-MaesterJob {
     )
 
     $now = [datetime]::UtcNow.ToString('o')
-    Invoke-SqliteQuery -DataSource $DbPath -Query @"
+    Invoke-MaesterSql -DbPath $DbPath -Query @"
         UPDATE jobs
         SET    status      = @status,
                updated_at  = @now,
@@ -119,7 +208,7 @@ function Update-MaesterJob {
                error       = @errorMsg,
                duration_ms = @durationMs
         WHERE  job_id      = @jobId
-"@ -SqlParameters @{
+"@ -Parameters @{
         jobId      = $JobId
         status     = $Status
         now        = $now
@@ -138,9 +227,9 @@ function Remove-MaesterJob {
         [Parameter(Mandatory)][string] $JobId
     )
 
-    Invoke-SqliteQuery -DataSource $DbPath -Query @"
+    Invoke-MaesterSql -DbPath $DbPath -Query @"
         DELETE FROM jobs WHERE job_id = @jobId
-"@ -SqlParameters @{ jobId = $JobId }
+"@ -Parameters @{ jobId = $JobId }
 }
 
 # ── Cleanup helpers ───────────────────────────────────────────────────────────
@@ -161,16 +250,16 @@ function Remove-ExpiredJobs {
     $completedCutoff = [datetime]::UtcNow.AddMinutes( -$CompletedTimeoutMinutes).ToString('o')
 
     # Hard: remove everything past max age
-    Invoke-SqliteQuery -DataSource $DbPath -Query @"
+    Invoke-MaesterSql -DbPath $DbPath -Query @"
         DELETE FROM jobs WHERE created_at < @cutoff
-"@ -SqlParameters @{ cutoff = $hardCutoff }
+"@ -Parameters @{ cutoff = $hardCutoff }
 
     # Soft: remove terminal-state jobs past the completed timeout
-    Invoke-SqliteQuery -DataSource $DbPath -Query @"
+    Invoke-MaesterSql -DbPath $DbPath -Query @"
         DELETE FROM jobs
         WHERE  status IN ('completed', 'failed')
           AND  updated_at < @cutoff
-"@ -SqlParameters @{ cutoff = $completedCutoff }
+"@ -Parameters @{ cutoff = $completedCutoff }
 }
 
 function Get-RunningJobCount {
@@ -179,7 +268,7 @@ function Get-RunningJobCount {
     #>
     param([Parameter(Mandatory)][string] $DbPath)
 
-    $row = Invoke-SqliteQuery -DataSource $DbPath -Query @"
+    $row = Invoke-MaesterSql -DbPath $DbPath -Query @"
         SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'
 "@
     return [int]$row.cnt
@@ -197,14 +286,14 @@ function Set-StaleJobsTimedOut {
     $cutoff = [datetime]::UtcNow.AddMinutes(-$StaleMinutes).ToString('o')
     $now    = [datetime]::UtcNow.ToString('o')
 
-    Invoke-SqliteQuery -DataSource $DbPath -Query @"
+    Invoke-MaesterSql -DbPath $DbPath -Query @"
         UPDATE jobs
         SET    status     = 'failed',
                error      = 'Job timed out (stale detection). Container may have restarted.',
                updated_at = @now
         WHERE  status = 'running'
           AND  created_at < @cutoff
-"@ -SqlParameters @{ cutoff = $cutoff; now = $now }
+"@ -Parameters @{ cutoff = $cutoff; now = $now }
 }
 
 # ── Stats / History ───────────────────────────────────────────────────────────
@@ -223,10 +312,10 @@ function Record-JobCompletion {
     )
 
     $now = [datetime]::UtcNow.ToString('o')
-    Invoke-SqliteQuery -DataSource $DbPath -Query @"
+    Invoke-MaesterSql -DbPath $DbPath -Query @"
         INSERT INTO job_stats (job_id, status, duration_ms, suites, completed_at)
         VALUES (@jobId, @status, @durationMs, @suites, @now)
-"@ -SqlParameters @{
+"@ -Parameters @{
         jobId      = $JobId
         status     = $Status
         durationMs = $DurationMs
@@ -243,7 +332,7 @@ function Get-JobStats {
     #>
     param([Parameter(Mandatory)][string] $DbPath)
 
-    $row = Invoke-SqliteQuery -DataSource $DbPath -Query @"
+    $row = Invoke-MaesterSql -DbPath $DbPath -Query @"
         SELECT
             COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS totalCompleted,
             COALESCE(SUM(CASE WHEN status = 'failed'    THEN 1 ELSE 0 END), 0) AS totalFailed,

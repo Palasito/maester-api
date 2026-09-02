@@ -27,6 +27,26 @@ COPY install-modules.ps1 /install-modules.ps1
 RUN ["pwsh", "-NoProfile", "-NonInteractive", "-File", "/install-modules.ps1"]
 RUN ["rm", "/install-modules.ps1"]
 
+# ─── Install Microsoft.Data.Sqlite NuGet packages ───────────────────────────
+# PSSQLite's System.Data.SQLite requires SQLite.Interop.dll (Windows-only native
+# companion). Microsoft.Data.Sqlite + SQLitePCLRaw works natively on Alpine.
+COPY install-sqlite-provider.ps1 /install-sqlite-provider.ps1
+RUN ["pwsh", "-NoProfile", "-NonInteractive", "-File", "/install-sqlite-provider.ps1"]
+RUN ["rm", "/install-sqlite-provider.ps1"]
+
+# ─── Patch Pode 2.12.1: cache GetNewClosure() to prevent memory leak ────────
+# Pode calls ScriptBlock.GetNewClosure() on every timer tick, middleware
+# invocation, and route handler call. Each closure creates a SessionState
+# snapshot (~5-6 KB) that accumulates at ~3.8 MB/hour because PowerShell's
+# internal references prevent GC from collecting them.
+#
+# Fix: Cache closures so GetNewClosure() is called at most ONCE per unique
+# ScriptBlock, not on every invocation. The cache is bounded by the number
+# of registered handlers (typically <30 entries).
+COPY patches/fix-pode-closures.ps1 /tmp/fix-pode-closures.ps1
+RUN ["pwsh", "-NoProfile", "-NonInteractive", "-File", "/tmp/fix-pode-closures.ps1"]
+RUN ["rm", "/tmp/fix-pode-closures.ps1"]
+
 # ─── Copy application code ──────────────────────────────────────────────────
 WORKDIR /app
 COPY server.ps1 /app/server.ps1
@@ -44,6 +64,18 @@ USER maester-api
 
 # Use a dedicated data directory for SQLite (not world-readable /tmp)
 ENV MAESTER_DB_PATH=/app/data/maester.db
+
+# ─── .NET GC tuning for long-lived PowerShell container ──────────────────────
+# GCConserveMemory=9 (max aggressiveness): GC returns segments to OS sooner,
+# compacts more often, and decommits freed pages — the main lever against
+# the ~3.4 MB/hr monotonic growth caused by .NET segment retention.
+#
+# NOTE: Do NOT set DOTNET_GCHeapHardLimit here. Docker ENV is inherited by
+# ALL processes in the container, including the Start-Job child pwsh that
+# loads ~300 MB of Maester/Pester/Graph/EXO/Teams/Az modules. A 200 MB cap
+# causes OOM in the child process, killing it silently and leaving the job
+# stuck as "running" until the 30-minute stale timeout.
+ENV DOTNET_GCConserveMemory=9
 
 EXPOSE 80
 

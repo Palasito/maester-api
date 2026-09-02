@@ -33,13 +33,14 @@ $VerbosePreference     = 'SilentlyContinue'
 # its memory — keeping the long-running Pode process lean.
 Write-Host '[server] Importing server modules...'
 Import-Module -Name Pode     -ErrorAction Stop
-Import-Module -Name PSSQLite -ErrorAction Stop
+# NOTE: Microsoft.Data.Sqlite + SQLitePCLRaw assemblies are loaded by lib/db.ps1.
+# No PSSQLite Import-Module needed — all SQL goes through raw ADO.NET.
 # NOTE: ThreadJob is intentionally NOT imported here. We use Start-Job (child
 # process) instead of Start-ThreadJob (thread in same process) so that the
 # ~300 MB of Maester/Pester/Graph module assemblies are fully reclaimed by the
 # OS when the child process exits after a test run. With Start-ThreadJob those
 # assemblies are loaded into the Pode process AppDomain and can never be freed.
-Write-Host '[server] Server modules loaded (Pode, PSSQLite).'
+Write-Host '[server] Server modules loaded (Pode).'
 
 # ─── Source lib/ helpers ──────────────────────────────────────────────────────
 Write-Host '[server] Loading lib/ modules...'
@@ -49,6 +50,78 @@ Write-Host '[server] Loading lib/ modules...'
 . /app/lib/maester-runner.ps1
 . /app/lib/inventory-builder.ps1
 Write-Host '[server] lib/ modules loaded.'
+
+# ─── Pre-build route-handler function blocks ──────────────────────────────────
+# Pode runspaces don't inherit the parent scope's functions. Previously, route
+# handlers re-sourced lib/*.ps1 on EVERY request — reading files, parsing AST,
+# creating new FunctionInfo objects each time. These PowerShell metadata objects
+# accumulate in the .NET type system and contribute to monotonic memory growth.
+#
+# Fix: Define the route-needed logic as ScriptBlocks here, captured via $using:
+# in route handlers. The ScriptBlock is serialized ONCE into the runspace and
+# reused on every request — zero file I/O, zero AST parsing, zero growth.
+
+$TestApiKeyBlock = {
+    param($Headers)
+    $expected = $env:MAESTER_API_KEY
+    if (-not $expected) { return $false }
+    $key = $Headers['X-Functions-Key']
+    if (-not $key) { $key = $Headers['X-Api-Key'] }
+    if (-not $key) { return $false }
+    return [System.Security.Cryptography.CryptographicOperations]::FixedTimeEquals(
+        [System.Text.Encoding]::UTF8.GetBytes($key),
+        [System.Text.Encoding]::UTF8.GetBytes($expected)
+    )
+}
+
+$GetBearerTokenBlock = {
+    param($Headers)
+    $authHeader = $Headers['Authorization']
+    if (-not $authHeader) { return $null }
+    if (-not $authHeader.StartsWith('Bearer ', [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+    $token = $authHeader.Substring(7).Trim()
+    if ($token.Length -lt 10) { return $null }
+    return $token
+}
+
+$TestValidTenantIdBlock = {
+    param([string]$TenantId)
+    $guidResult = [guid]::Empty
+    return [guid]::TryParse($TenantId, [ref]$guidResult)
+}
+
+$RecordJobCompletionBlock = {
+    param([string]$DbPath, [string]$JobId, [string]$Status, [int]$DurationMs, [string]$Suites)
+    $now  = [datetime]::UtcNow.ToString('o')
+    $conn = $null; $cmd = $null
+    try {
+        $conn = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$DbPath")
+        $conn.Open()
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = 'INSERT INTO job_stats (job_id, status, duration_ms, suites, completed_at) VALUES (@jobId, @status, @durationMs, @suites, @now)'
+        $null = $cmd.Parameters.AddWithValue('@jobId',      $JobId)
+        $null = $cmd.Parameters.AddWithValue('@status',     $Status)
+        $null = $cmd.Parameters.AddWithValue('@durationMs', $DurationMs)
+        $null = $cmd.Parameters.AddWithValue('@suites',     $Suites)
+        $null = $cmd.Parameters.AddWithValue('@now',        $now)
+        $null = $cmd.ExecuteNonQuery()
+    } finally {
+        if ($cmd)  { $cmd.Dispose() }
+        if ($conn) { $conn.Dispose() }
+    }
+}
+
+$FormatDurationBlock = {
+    param([int]$ms)
+    if ($ms -le 0) { return 'N/A' }
+    $totalSec = [math]::Round($ms / 1000)
+    if ($totalSec -lt 60) { return "${totalSec}s" }
+    $m = [math]::Floor($totalSec / 60)
+    $s = $totalSec % 60
+    return "${m}m ${s}s"
+}
+
+Write-Host '[server] Route handler ScriptBlocks pre-built.'
 
 # ─── Security: Validate required environment variables at startup ─────────────
 if (-not $env:MAESTER_API_KEY) {
@@ -119,10 +192,20 @@ $INITIAL_HEALTH = @{
     minDurationMs   = [int]0
     maxDurationMs   = [int]0
     lastCompletedAt = $null
+    # Pre-formatted duration strings for dashboard (avoids Format-Duration per request)
+    avgDurationStr  = 'N/A'
+    minDurationStr  = 'N/A'
+    maxDurationStr  = 'N/A'
 }
 try {
-    $initRow = Invoke-SqliteQuery -DataSource $DB_PATH -Query "SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'"
-    $INITIAL_HEALTH.activeJobs = [int]$initRow.cnt
+    $initConn = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$DB_PATH")
+    try {
+        $initConn.Open()
+        $initCmd = $initConn.CreateCommand()
+        $initCmd.CommandText = "SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'"
+        $INITIAL_HEALTH.activeJobs = [int]$initCmd.ExecuteScalar()
+        $initCmd.Dispose()
+    } finally { $initConn.Dispose() }
     $initStats = Get-JobStats -DbPath $DB_PATH
     if ($initStats) {
         $INITIAL_HEALTH.totalCompleted  = [int]$initStats.totalCompleted
@@ -248,38 +331,44 @@ Start-PodeServer -Threads 1 {
         $now    = [datetime]::UtcNow
         $cutoff = $now.AddSeconds(-$windowSeconds)
 
-        Lock-PodeObject -Name 'RateLimitLock' -ScriptBlock {
-            $rl = Get-PodeState -Name 'RateLimiter'
-            if (-not $rl.Requests.ContainsKey($clientIp)) {
-                $rl.Requests[$clientIp] = [System.Collections.ArrayList]::new()
-            }
-            $timestamps = $rl.Requests[$clientIp]
-            # Purge expired timestamps for this IP
-            $expired = @($timestamps | Where-Object { $_ -lt $cutoff })
-            foreach ($e in $expired) { $timestamps.Remove($e) }
-
-            # Memory leak fix: remove stale IP entries that have no recent activity.
-            # Without this, every unique IP (health probes, load balancers, etc.)
-            # accumulates an empty ArrayList entry forever.
-            $staleIps = @($rl.Requests.Keys | Where-Object {
-                $rl.Requests[$_].Count -eq 0 -and $_ -ne $clientIp
-            })
-            foreach ($ip in $staleIps) { $rl.Requests.Remove($ip) }
-
-            if ($timestamps.Count -ge $maxRequests) {
-                $WebEvent.Response.StatusCode = 429
-                $WebEvent.Response.Headers['Retry-After'] = $windowSeconds.ToString()
-                Write-PodeJsonResponse -Value @{ error = 'Too many requests. Please slow down.' }
-                return $false
-            }
-
-            $timestamps.Add($now) | Out-Null
+        # LOCK-FREE: With -Threads 1, only one request thread exists.
+        # The Synchronized hashtable handles atomic per-key access.
+        # Previous Lock-PodeObject created closure allocations per request.
+        $rl = Get-PodeState -Name 'RateLimiter'
+        if (-not $rl.Requests.ContainsKey($clientIp)) {
+            $rl.Requests[$clientIp] = [System.Collections.ArrayList]::new()
         }
+        $timestamps = $rl.Requests[$clientIp]
+
+        # Purge expired timestamps (reverse foreach avoids Where-Object pipeline allocations)
+        for ($i = $timestamps.Count - 1; $i -ge 0; $i--) {
+            if ($timestamps[$i] -lt $cutoff) {
+                $timestamps.RemoveAt($i)
+            }
+        }
+
+        # Clean stale IPs — empty ArrayLists from old clients (health probes, etc.)
+        # Uses snapshot + foreach instead of Where-Object to avoid enumerator allocations.
+        $keysSnapshot = @($rl.Requests.Keys)
+        foreach ($ip in $keysSnapshot) {
+            if ($ip -ne $clientIp -and $rl.Requests[$ip].Count -eq 0) {
+                $rl.Requests.Remove($ip)
+            }
+        }
+
+        if ($timestamps.Count -ge $maxRequests) {
+            $WebEvent.Response.StatusCode = 429
+            $WebEvent.Response.Headers['Retry-After'] = $windowSeconds.ToString()
+            Write-PodeJsonResponse -Value @{ error = 'Too many requests. Please slow down.' }
+            return $false
+        }
+
+        $null = $timestamps.Add($now)
         return $true
     }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Resource monitoring: CPU + RAM sampling every 30 seconds
+    # Resource monitoring: CPU + RAM sampling every 120 seconds
     # ══════════════════════════════════════════════════════════════════════════
     # Seed initial /proc/stat reading so the first timer tick can compute a delta.
     $initCpuIdle  = [long]0
@@ -293,9 +382,9 @@ Start-PodeServer -Threads 1 {
 
     Set-PodeState -Name 'ResourceMonitor' -Value @{
         # Fixed-size circular buffer — avoids ArrayList.RemoveAt(0) O(n) copy + heap fragmentation
-        Samples      = [object[]]::new(120)   # 120 slots = 1 hour at 30s intervals
+        Samples      = [object[]]::new(30)    # 30 slots × 300s ≈ 2.5 hours
         WriteIndex   = [int]0                  # Next write position
-        Count        = [int]0                  # Valid samples (grows to 120 then stays)
+        Count        = [int]0                  # Valid samples (grows to 30 then stays)
         LastCpuIdle  = $initCpuIdle
         LastCpuTotal = $initCpuTotal
         # Pre-computed values so /health doesn't need to iterate the buffer
@@ -307,10 +396,27 @@ Start-PodeServer -Threads 1 {
         # Reused across ticks to avoid per-tick allocations
         CapturedValues   = @{ cpu = [double]0; cpuAvg = [double]0; ram = [double]0; ramMax = [double]0; ramAvg = [double]0 }
         JsonBuilder      = [System.Text.StringBuilder]::new(512)
+        # Tick counter for merged sub-tasks: HealthRefresher (every 2nd = ~600s) + MemoryLogger (every 6th = ~1800s)
+        TickCount        = [int]0
+        # Pre-built /health JSON string — updated each tick, read by /health route
+        HealthJson       = $INITIAL_HEALTH_JSON
     }
 
-    Add-PodeTimer -Name 'ResourceSampler' -Interval 30 -ScriptBlock {
+    # ── Pre-capture PodeState references for $using: access ───────────────
+    # Eliminates 7+ Get-PodeState/Set-PodeState cmdlet calls per timer tick.
+    # Each cmdlet invocation creates ~10 .NET objects (CommandProcessor,
+    # ParameterBinding, PipelineProcessor) that accumulate in Gen2 over time.
+    $_resmon   = Get-PodeState -Name 'ResourceMonitor'
+    $_hcache   = Get-PodeState -Name 'HealthCache'
+    $_CgroupV2 = [System.IO.File]::Exists('/sys/fs/cgroup/memory.current')
+
+    Add-PodeTimer -Name 'ResourceSampler' -Interval 300 -ScriptBlock {
         $startTime = $using:SERVER_START_TIME
+        $dbPath    = $using:DB_PATH
+        $fmtDur    = $using:FormatDurationBlock
+        $cgV2      = $using:_CgroupV2
+        $mon       = $using:_resmon
+        $hc        = $using:_hcache
         try {
             # ── CPU from /proc/stat (StreamReader avoids Get-Content overhead) ─
             $sr = [System.IO.StreamReader]::new('/proc/stat')
@@ -323,13 +429,13 @@ Start-PodeServer -Threads 1 {
 
             # ── RAM from cgroup (File I/O avoids Get-Content cmdlet overhead) ─
             $ramUsedMB = [double]0; $ramTotalMB = [double]0
-            if (Test-Path '/sys/fs/cgroup/memory.current') {
+            if ($cgV2) {
                 # cgroup v2
                 $ramUsedMB  = [math]::Round([long]([System.IO.File]::ReadAllText('/sys/fs/cgroup/memory.current').Trim()) / 1MB, 1)
                 $maxRaw     = [System.IO.File]::ReadAllText('/sys/fs/cgroup/memory.max').Trim()
                 $ramTotalMB = if ($maxRaw -eq 'max') { 0 } else { [math]::Round([long]$maxRaw / 1MB, 1) }
             }
-            elseif (Test-Path '/sys/fs/cgroup/memory/memory.usage_in_bytes') {
+            elseif ([System.IO.File]::Exists('/sys/fs/cgroup/memory/memory.usage_in_bytes')) {
                 # cgroup v1
                 $ramUsedMB  = [math]::Round([long]([System.IO.File]::ReadAllText('/sys/fs/cgroup/memory/memory.usage_in_bytes').Trim()) / 1MB, 1)
                 $limitRaw   = [System.IO.File]::ReadAllText('/sys/fs/cgroup/memory/memory.limit_in_bytes').Trim()
@@ -344,13 +450,8 @@ Start-PodeServer -Threads 1 {
                 $ramUsedMB  = [math]::Round(($totalKB - $availKB) / 1024, 1)
             }
 
-            # Reuse persistent CapturedValues hashtable from PodeState (zero allocation)
-            $captured = (Get-PodeState -Name 'ResourceMonitor').CapturedValues
-
-            # LOCK-FREE: Single writer (this timer) + dashboard reader with -Threads 1.
-            # Lock-PodeObject creates a closure allocation per tick (2880/day).
-            # Worst case without lock: dashboard shows slightly stale gauge values.
-            $mon = Get-PodeState -Name 'ResourceMonitor'
+            # Reuse persistent CapturedValues hashtable (zero allocation per tick)
+            $captured = $mon.CapturedValues
 
             $idleDelta  = $idle  - $mon.LastCpuIdle
             $totalDelta = $total - $mon.LastCpuTotal
@@ -361,7 +462,7 @@ Start-PodeServer -Threads 1 {
             $mon.LastCpuIdle  = $idle
             $mon.LastCpuTotal = $total
 
-            # Reuse circular buffer sample in-place (zero allocation after first 120)
+            # Reuse circular buffer sample in-place (zero allocation after first 30)
             $sample = $mon.Samples[$mon.WriteIndex]
             if ($null -eq $sample) {
                 $mon.Samples[$mon.WriteIndex] = @{
@@ -374,8 +475,8 @@ Start-PodeServer -Threads 1 {
                 $sample.Ram    = [double]$ramUsedMB
                 $sample.RamMax = [double]$ramTotalMB
             }
-            $mon.WriteIndex = ($mon.WriteIndex + 1) % 120
-            if ($mon.Count -lt 120) { $mon.Count++ }
+            $mon.WriteIndex = ($mon.WriteIndex + 1) % 30
+            if ($mon.Count -lt 30) { $mon.Count++ }
 
             # Store latest snapshot for fast reads
             $mon.LatestCpuPercent = [double]$cpuPercent
@@ -399,13 +500,114 @@ Start-PodeServer -Threads 1 {
             $captured.ramMax = $mon.LatestRamTotalMB
             $captured.ramAvg = $mon.AvgRamUsedMB
 
+            # ── Merged HealthRefresher: every 2nd tick (~600s) ─────────────
+            $mon.TickCount++
+            if ($mon.TickCount % 2 -eq 0) {
+                try {
+                    $conn = $null; $cmd = $null; $reader = $null
+                    try {
+                        $conn = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$dbPath")
+                        $conn.Open()
+
+                        # Active jobs count
+                        $cmd = $conn.CreateCommand()
+                        $cmd.CommandText = "SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'"
+                        $activeJobs = [int]$cmd.ExecuteScalar()
+                        $cmd.Dispose(); $cmd = $null
+
+                        # Job stats
+                        $cmd = $conn.CreateCommand()
+                        $cmd.CommandText = @"
+                            SELECT
+                                COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS totalCompleted,
+                                COALESCE(SUM(CASE WHEN status = 'failed'    THEN 1 ELSE 0 END), 0) AS totalFailed,
+                                COALESCE(AVG(CASE WHEN status = 'completed' AND duration_ms > 0 THEN duration_ms END), 0) AS avgDurationMs,
+                                COALESCE(MIN(CASE WHEN status = 'completed' AND duration_ms > 0 THEN duration_ms END), 0) AS minDurationMs,
+                                COALESCE(MAX(CASE WHEN status = 'completed' AND duration_ms > 0 THEN duration_ms END), 0) AS maxDurationMs,
+                                MAX(completed_at) AS lastCompletedAt
+                            FROM job_stats
+"@
+                        $reader = $cmd.ExecuteReader()
+
+                        $hc.dbConnected = $true
+                        $hc.activeJobs  = $activeJobs
+
+                        if ($reader.Read()) {
+                            $hc.totalCompleted  = [int]$reader['totalCompleted']
+                            $hc.totalFailed     = [int]$reader['totalFailed']
+                            $hc.avgDurationMs   = [math]::Round([double]$reader['avgDurationMs'])
+                            $hc.minDurationMs   = [int]$reader['minDurationMs']
+                            $hc.maxDurationMs   = [int]$reader['maxDurationMs']
+                            $hc.lastCompletedAt = if ($reader.IsDBNull($reader.GetOrdinal('lastCompletedAt'))) { $null } else { $reader['lastCompletedAt'] }
+                            $hc.avgDurationStr  = & $fmtDur ([int]$reader['avgDurationMs'])
+                            $hc.minDurationStr  = & $fmtDur ([int]$reader['minDurationMs'])
+                            $hc.maxDurationStr  = & $fmtDur ([int]$reader['maxDurationMs'])
+                        }
+                        $reader.Dispose(); $reader = $null
+                    } finally {
+                        if ($reader) { $reader.Dispose() }
+                        if ($cmd)    { $cmd.Dispose() }
+                        if ($conn)   { $conn.Dispose() }
+                    }
+                } catch {
+                    $hc.dbConnected = $false
+                }
+            }
+
+            # ── Merged MemoryLogger: every 6th tick (~1800s = 30min) ─────
+            if ($mon.TickCount % 6 -eq 0) {
+                try {
+                    $now = [datetime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss')
+                    $uptimeSecLog = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
+                    $gcInfo = [System.GC]::GetGCMemoryInfo()
+                    $managedMB   = [math]::Round([System.GC]::GetTotalMemory($false) / 1MB, 2)
+                    $committedMB = [math]::Round($gcInfo.TotalCommittedBytes / 1MB, 2)
+                    $fragMB      = [math]::Round($gcInfo.FragmentedBytes / 1MB, 2)
+                    $gen0 = [System.GC]::CollectionCount(0)
+                    $gen1 = [System.GC]::CollectionCount(1)
+                    $gen2 = [System.GC]::CollectionCount(2)
+
+                    $rssAnonKB = 0; $threads = 0
+                    try {
+                        $statusLines = [System.IO.File]::ReadAllLines('/proc/self/status')
+                        foreach ($sLine in $statusLines) {
+                            if ($sLine.StartsWith('RssAnon:')) { $rssAnonKB = [int]($sLine -replace '[^0-9]', '') }
+                            if ($sLine.StartsWith('Threads:')) { $threads   = [int]($sLine -replace '[^0-9]', '') }
+                        }
+                        $statusLines = $null
+                    } catch { }
+
+                    $cgroupAnonMB  = 0; $cgroupTotalMB = 0
+                    try {
+                        $cgroupTotalMB = [math]::Round([long]([System.IO.File]::ReadAllText('/sys/fs/cgroup/memory.current').Trim()) / 1MB, 2)
+                        $cgStat = [System.IO.File]::ReadAllLines('/sys/fs/cgroup/memory.stat')
+                        foreach ($sLine in $cgStat) {
+                            if ($sLine.StartsWith('anon ')) { $cgroupAnonMB = [math]::Round([long]($sLine -split ' ')[1] / 1MB, 2) }
+                        }
+                        $cgStat = $null
+                    } catch { }
+
+                    $logPath = '/tmp/memory.log'
+                    $header  = 'timestamp,uptimeSec,managedMB,committedMB,fragMB,rssAnonKB,cgroupAnonMB,cgroupTotalMB,gen0,gen1,gen2,threads'
+                    if (-not [System.IO.File]::Exists($logPath)) {
+                        [System.IO.File]::WriteAllText($logPath, "$header`n")
+                    }
+                    $logLine = "$now,$uptimeSecLog,$managedMB,$committedMB,$fragMB,$rssAnonKB,$cgroupAnonMB,$cgroupTotalMB,$gen0,$gen1,$gen2,$threads"
+                    [System.IO.File]::AppendAllText($logPath, "$logLine`n")
+
+                    $gcInfo = $null
+
+                    # Periodic memory compaction (~every 30 min).
+                    # Defragments LOH and compacts Gen2 segments, releasing memory
+                    # back to OS. Safe at this frequency — transient Gen0/Gen1
+                    # objects have long since been collected naturally (unlike the
+                    # old per-tick Invoke-PodeGC removed in Patch 3).
+                    [System.Runtime.GCSettings]::LargeObjectHeapCompactionMode = [System.Runtime.GCLargeObjectHeapCompactionMode]::CompactOnce
+                    [System.GC]::Collect(2, [System.GCCollectionMode]::Aggressive, $true, $true)
+                } catch { }
+            }
+
             # ── Pre-build /health JSON with reusable StringBuilder ────────
-            # MEMORY FIX: Eliminates ConvertTo-Json + OrderedDictionary per tick.
-            # ConvertTo-Json creates ~30 KB of transient .NET objects per call
-            # (PSObject wrappers, JsonWriter, internal StringBuilder). Over 2880
-            # ticks/day, a fraction get promoted to Gen-2 before our Gen-1 GC,
-            # causing monotonic RSS growth (~100 MB/day). StringBuilder.Append
-            # creates zero intermediate objects; the builder is reused across ticks.
             $hc  = Get-PodeState -Name 'HealthCache'
             $inv = [System.Globalization.CultureInfo]::InvariantCulture
             $uptimeSec = [math]::Round(([datetime]::UtcNow - $startTime).TotalSeconds)
@@ -414,7 +616,7 @@ Start-PodeServer -Threads 1 {
             $dbBool    = if ($hc.dbConnected) { 'true' } else { 'false' }
             $lastVal   = if ($hc.lastCompletedAt) { '"' + $hc.lastCompletedAt + '"' } else { 'null' }
 
-            $sb = (Get-PodeState -Name 'ResourceMonitor').JsonBuilder
+            $sb = $mon.JsonBuilder
             $null = $sb.Clear()
             $null = $sb.Append('{"status":"ok","uptime":').Append($uptimeSec)
             $null = $sb.Append(',"dbConnected":').Append($dbBool)
@@ -433,83 +635,27 @@ Start-PodeServer -Threads 1 {
             $null = $sb.Append(',"maxDurationMs":').Append([int]$hc.maxDurationMs)
             $null = $sb.Append(',"lastCompletedAt":').Append($lastVal).Append('}')
 
-            Set-PodeState -Name 'HealthJson' -Value $sb.ToString()
+            $mon.HealthJson = $sb.ToString()
         } catch { }
 
-        # Null out temporary variables so GC sees them as unreachable.
+        # Clear accumulated error records and null out temp vars so GC can reclaim.
+        $Error.Clear()
         $cpuLine = $null; $fields = $null; $idle = $null; $total = $null
         $ramUsedMB = $null; $ramTotalMB = $null; $memInfo = $null
         $captured = $null; $hc = $null; $sb = $null; $inv = $null
-
-        # Gen-1 GC: catches objects promoted from Gen-0 during .NET's automatic
-        # collections between our explicit calls. Previous Gen-0-only strategy
-        # failed because objects were still on the stack at GC time → promoted
-        # to Gen-1 → never collected until the 15-minute full GC in JobCleanup.
-        [System.GC]::Collect(1, [System.GCCollectionMode]::Optimized)
-    }
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # HealthRefresher: Refresh job stats from SQLite every 5 minutes
-    #
-    # MEMORY FIX: SQL queries were previously in ResourceSampler (every 30s),
-    # creating ~46,000 Invoke-SqliteQuery DataTable allocations over 8 days.
-    # Job stats only change when a run completes — 5-minute refresh is ideal
-    # for idle servers and still responsive during active runs.
-    # ══════════════════════════════════════════════════════════════════════════
-    Add-PodeTimer -Name 'HealthRefresher' -Interval 300 -ScriptBlock {
-        $dbPath = $using:DB_PATH
-        try {
-            $row = Invoke-SqliteQuery -DataSource $dbPath -Query "SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running'"
-            $statsRow = Invoke-SqliteQuery -DataSource $dbPath -Query @"
-                SELECT
-                    COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS totalCompleted,
-                    COALESCE(SUM(CASE WHEN status = 'failed'    THEN 1 ELSE 0 END), 0) AS totalFailed,
-                    COALESCE(AVG(CASE WHEN status = 'completed' AND duration_ms > 0
-                                 THEN duration_ms END), 0)                              AS avgDurationMs,
-                    COALESCE(MIN(CASE WHEN status = 'completed' AND duration_ms > 0
-                                 THEN duration_ms END), 0)                              AS minDurationMs,
-                    COALESCE(MAX(CASE WHEN status = 'completed' AND duration_ms > 0
-                                 THEN duration_ms END), 0)                              AS maxDurationMs,
-                    MAX(completed_at)                                                    AS lastCompletedAt
-                FROM job_stats
-"@
-            # LOCK-FREE: HealthCache is [hashtable]::Synchronized — per-key writes are atomic.
-            # Eliminates 2 Lock-PodeObject closure allocations per 5-min tick.
-            $hc = Get-PodeState -Name 'HealthCache'
-            $hc.dbConnected     = $true
-            $hc.activeJobs      = [int]$row.cnt
-            if ($statsRow) {
-                $hc.totalCompleted  = [int]$statsRow.totalCompleted
-                $hc.totalFailed     = [int]$statsRow.totalFailed
-                $hc.avgDurationMs   = [math]::Round([double]$statsRow.avgDurationMs)
-                $hc.minDurationMs   = [int]$statsRow.minDurationMs
-                $hc.maxDurationMs   = [int]$statsRow.maxDurationMs
-                $hc.lastCompletedAt = if ($statsRow.lastCompletedAt) { $statsRow.lastCompletedAt } else { $null }
-            }
-        } catch {
-            (Get-PodeState -Name 'HealthCache').dbConnected = $false
-        }
-
-        # Null out SQL result objects (DataTable/DataRow) before GC.
-        $row = $null; $statsRow = $null
-
-        # Aggressive GC every 5 min: collects all generations, compacts LOH,
-        # and returns freed pages to the OS. Standard GC.Collect() frees objects
-        # but may not decommit memory — causing monotonic RSS growth in containers.
-        [System.Runtime.GCSettings]::LargeObjectHeapCompactionMode = [System.Runtime.GCLargeObjectHeapCompactionMode]::CompactOnce
-        [System.GC]::Collect(2, [System.GCCollectionMode]::Aggressive, $true, $true)
-        [System.GC]::WaitForPendingFinalizers()
-        [System.GC]::Collect(2, [System.GCCollectionMode]::Aggressive, $true, $true)
     }
 
     # ══════════════════════════════════════════════════════════════════════════
     # Middleware: API key validation on /api/* routes
     # ══════════════════════════════════════════════════════════════════════════
     Add-PodeMiddleware -Name 'ApiKeyAuth' -Route '/api/*' -ScriptBlock {
-        # Re-source auth helpers (Pode runspaces don't share parent scope)
-        . /app/lib/auth.ps1
+        # MEMORY FIX: Previously dot-sourced /app/lib/auth.ps1 on every /api/*
+        # request — parsing the file, building AST, creating FunctionInfo objects
+        # each time. Over days, these unreclaimable objects caused monotonic growth.
+        # Now uses a pre-built ScriptBlock captured via $using: (zero allocations).
+        $testKey = $using:TestApiKeyBlock
 
-        if (-not (Test-ApiKey -Headers $WebEvent.Request.Headers)) {
+        if (-not (& $testKey $WebEvent.Request.Headers)) {
             $WebEvent.Response.StatusCode = 401
             # Generic message — never reveal whether the key is missing vs invalid
             Write-PodeJsonResponse -Value @{ error = 'Unauthorized.' }
@@ -522,21 +668,18 @@ Start-PodeServer -Threads 1 {
     # GET / — HTML stats dashboard (public)
     #
     # MEMORY-CRITICAL: Reads all data from PodeState caches. No dot-sourcing,
-    # no Import-Module, no SQL. Data is refreshed every 30s by the
+    # no Import-Module, no SQL. Data is refreshed every 5 min by the
     # ResourceSampler timer; JS polls /health to keep the page live.
     # ══════════════════════════════════════════════════════════════════════════
     Add-PodeRoute -Method Get -Path '/' -ScriptBlock {
         $startTime = $using:SERVER_START_TIME
 
         # Read cached health data — no lock needed, HealthCache is [hashtable]::Synchronized
-        $hcState = Get-PodeState -Name 'HealthCache'
+        $hcState = $using:_hcache
         $dbOkRead       = $hcState.dbConnected
         $activeJobsRead = $hcState.activeJobs
         $completedRead  = $hcState.totalCompleted
         $failedRead     = $hcState.totalFailed
-        $avgMsRead      = $hcState.avgDurationMs
-        $minMsRead      = $hcState.minDurationMs
-        $maxMsRead      = $hcState.maxDurationMs
         $lastRunRead    = $hcState.lastCompletedAt
 
         $dbOk       = $dbOkRead
@@ -544,9 +687,6 @@ Start-PodeServer -Threads 1 {
         $completed  = $completedRead
         $failed     = $failedRead
         $totalRuns  = $completed + $failed
-        $avgMs      = $avgMsRead
-        $minMs      = $minMsRead
-        $maxMs      = $maxMsRead
         $lastRun    = if ($lastRunRead) { $lastRunRead } else { 'N/A' }
         $successRate = if ($totalRuns -gt 0) { [math]::Round(($completed / $totalRuns) * 100, 1) } else { 0 }
 
@@ -557,18 +697,12 @@ Start-PodeServer -Threads 1 {
                       ($uptimeSec % 60)
         $dbStatus   = if ($dbOk) { '&#x2705; Connected' } else { '&#x274C; Disconnected' }
 
-        # Format durations as human-readable
-        function Format-Duration([int]$ms) {
-            if ($ms -le 0) { return 'N/A' }
-            $totalSec = [math]::Round($ms / 1000)
-            if ($totalSec -lt 60) { return "${totalSec}s" }
-            $m = [math]::Floor($totalSec / 60)
-            $s = $totalSec % 60
-            return "${m}m ${s}s"
-        }
-        $avgStr = Format-Duration $avgMs
-        $minStr = Format-Duration $minMs
-        $maxStr = Format-Duration $maxMs
+        # MEMORY FIX: Duration strings are now pre-computed by the HealthRefresher
+        # timer and cached in HealthCache. Previously, 'function Format-Duration'
+        # was defined HERE — creating a new FunctionInfo object on every page load.
+        $avgStr = $hcState.avgDurationStr
+        $minStr = $hcState.minDurationStr
+        $maxStr = $hcState.maxDurationStr
 
         # ── Resource metrics from cached state (lock-free, single writer) ──
         $mon = Get-PodeState -Name 'ResourceMonitor'
@@ -785,7 +919,7 @@ function poll() {
     }).catch(function() { setText('last-updated', 'Poll failed — retrying…'); });
 }
 poll();
-setInterval(poll, 30000);
+setInterval(poll, 300000);
 </script>
 </body>
 </html>
@@ -797,27 +931,23 @@ setInterval(poll, 30000);
     # ══════════════════════════════════════════════════════════════════════════
     # GET /health — Container health check (public, lightweight)
     #
-    # MEMORY-CRITICAL: This endpoint is polled every 15 seconds by the
+    # MEMORY-CRITICAL: This endpoint is polled every 120 seconds by the
     # dashboard JS. It must NOT dot-source files, import modules, or run SQL.
     # All data is read from PodeState caches updated by the ResourceSampler
-    # timer (every 30s). This eliminates ~389K dot-source + module-import
-    # operations over 4 days that caused the ~500MB idle memory leak.
+    # timer (every 120s).
     # ══════════════════════════════════════════════════════════════════════════
     Add-PodeRoute -Method Get -Path '/health' -ScriptBlock {
         # ZERO-ALLOCATION: Serve the pre-built JSON string directly.
-        # The ResourceSampler timer (30s) rebuilds this string with fresh
+        # The ResourceSampler timer (300s) rebuilds this string with fresh
         # CPU/RAM metrics + cached DB stats. No hashtable creation, no
-        # Lock-PodeObject closures, no ConvertTo-Json per request.
-        # At 15s polling from dashboard + Azure health probes, this
-        # eliminates ~46K+ object allocations over 8 days.
-        $json = Get-PodeState -Name 'HealthJson'
-        Write-PodeTextResponse -Value $json -ContentType 'application/json'
+        # ConvertTo-Json or Get-PodeState per request.
+        Write-PodeTextResponse -Value ($using:_resmon).HealthJson -ContentType 'application/json'
     }
 
-    # GET /diag — GC diagnostics (temporary, remove after memory investigation)
+    # GET /diag — GC + native memory diagnostics (memory investigation)
     Add-PodeRoute -Method Get -Path '/diag' -ScriptBlock {
         $info = [System.GC]::GetGCMemoryInfo()
-        $diag = @{
+        $diag = [ordered]@{
             managedHeapMB   = [math]::Round([System.GC]::GetTotalMemory($false) / 1MB, 2)
             gen0Collections = [System.GC]::CollectionCount(0)
             gen1Collections = [System.GC]::CollectionCount(1)
@@ -829,7 +959,44 @@ setInterval(poll, 30000);
             finalizePending = $info.FinalizationPendingCount
             pauseDurationsMs = @($info.PauseDurations | ForEach-Object { [math]::Round($_.TotalMilliseconds, 1) })
         }
+
+        # Native memory from /proc/self/status (RssAnon = heap + JIT + PS metadata)
+        try {
+            $statusLines = [System.IO.File]::ReadAllLines('/proc/self/status')
+            foreach ($line in $statusLines) {
+                if ($line.StartsWith('VmRSS:'))    { $diag.vmRssKB    = [int]($line -replace '[^0-9]', '') }
+                if ($line.StartsWith('RssAnon:'))   { $diag.rssAnonKB  = [int]($line -replace '[^0-9]', '') }
+                if ($line.StartsWith('RssFile:'))    { $diag.rssFileKB  = [int]($line -replace '[^0-9]', '') }
+                if ($line.StartsWith('RssShmem:'))   { $diag.rssShmemKB = [int]($line -replace '[^0-9]', '') }
+                if ($line.StartsWith('Threads:'))    { $diag.threads    = [int]($line -replace '[^0-9]', '') }
+            }
+            $statusLines = $null
+        } catch { }
+
+        # Cgroup memory breakdown (container-level)
+        try {
+            $diag.cgroupTotalMB = [math]::Round([long]([System.IO.File]::ReadAllText('/sys/fs/cgroup/memory.current').Trim()) / 1MB, 2)
+            $cgStat = [System.IO.File]::ReadAllLines('/sys/fs/cgroup/memory.stat')
+            foreach ($line in $cgStat) {
+                if ($line.StartsWith('anon '))  { $diag.cgroupAnonMB = [math]::Round([long]($line -split ' ')[1] / 1MB, 2) }
+                if ($line.StartsWith('file '))  { $diag.cgroupFileMB = [math]::Round([long]($line -split ' ')[1] / 1MB, 2) }
+                if ($line.StartsWith('shmem ')) { $diag.cgroupShmemMB = [math]::Round([long]($line -split ' ')[1] / 1MB, 2) }
+            }
+            $cgStat = $null
+        } catch { }
+
         Write-PodeJsonResponse -Value $diag
+    }
+
+    # GET /diag/log — Retrieve the periodic memory log CSV
+    Add-PodeRoute -Method Get -Path '/diag/log' -ScriptBlock {
+        $logPath = '/tmp/memory.log'
+        if ([System.IO.File]::Exists($logPath)) {
+            $content = [System.IO.File]::ReadAllText($logPath)
+            Write-PodeTextResponse -Value $content -ContentType 'text/csv'
+        } else {
+            Write-PodeTextResponse -Value 'No memory log yet (first entry after 30 min).' -ContentType 'text/plain'
+        }
     }
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -853,10 +1020,7 @@ setInterval(poll, 30000);
     Add-PodeRoute -Method Get -Path '/api/maester' -ScriptBlock {
         $dbPath       = $using:DB_PATH
         $staleMinutes = $using:JOB_STALE_MINUTES
-
-        Import-Module PSSQLite -ErrorAction SilentlyContinue
-        # Re-source db helpers (Pode runspaces don't share parent scope)
-        . /app/lib/db.ps1
+        $recordCompletion = $using:RecordJobCompletionBlock
 
         # ── Validate jobId ────────────────────────────────────────────────────
         $jobId = $WebEvent.Query['jobId']
@@ -872,10 +1036,24 @@ setInterval(poll, 30000);
             return
         }
 
-        # ── Fetch from SQLite ─────────────────────────────────────────────────
-        $job = Invoke-SqliteQuery -DataSource $dbPath -Query @"
-            SELECT * FROM jobs WHERE job_id = @jobId
-"@ -SqlParameters @{ jobId = $jobId }
+        # ── Fetch from SQLite (raw ADO.NET) ──────────────────────────────────
+        $conn = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$dbPath")
+        $job = $null
+        try {
+            $conn.Open()
+            $cmd = $conn.CreateCommand()
+            $cmd.CommandText = 'SELECT * FROM jobs WHERE job_id = @jobId'
+            $null = $cmd.Parameters.AddWithValue('@jobId', $jobId)
+            $reader = $cmd.ExecuteReader()
+            if ($reader.Read()) {
+                $job = [PSCustomObject]@{}
+                for ($i = 0; $i -lt $reader.FieldCount; $i++) {
+                    $val = if ($reader.IsDBNull($i)) { $null } else { $reader.GetValue($i) }
+                    $job | Add-Member -NotePropertyName $reader.GetName($i) -NotePropertyValue $val
+                }
+            }
+            $reader.Dispose(); $cmd.Dispose()
+        } finally { $conn.Dispose() }
 
         if (-not $job) {
             $WebEvent.Response.StatusCode = 404
@@ -890,21 +1068,31 @@ setInterval(poll, 30000);
                 $elapsed = ([datetime]::UtcNow - $created).TotalMinutes
                 if ($elapsed -gt $staleMinutes) {
                     $now = [datetime]::UtcNow.ToString('o')
-                    Invoke-SqliteQuery -DataSource $dbPath -Query @"
-                        UPDATE jobs
-                        SET    status = 'failed',
-                               error  = @error,
-                               updated_at = @now
-                        WHERE  job_id = @jobId AND status = 'running'
-"@ -SqlParameters @{
-                        jobId = $jobId
-                        error = "Job timed out after $([math]::Round($elapsed)) minutes."
-                        now   = $now
-                    }
-                    # Re-read the updated row
-                    $job = Invoke-SqliteQuery -DataSource $dbPath -Query @"
-                        SELECT * FROM jobs WHERE job_id = @jobId
-"@ -SqlParameters @{ jobId = $jobId }
+                    $conn2 = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$dbPath")
+                    try {
+                        $conn2.Open()
+                        # Update stale job
+                        $cmd2 = $conn2.CreateCommand()
+                        $cmd2.CommandText = "UPDATE jobs SET status = 'failed', error = @error, updated_at = @now WHERE job_id = @jobId AND status = 'running'"
+                        $null = $cmd2.Parameters.AddWithValue('@jobId', $jobId)
+                        $null = $cmd2.Parameters.AddWithValue('@error', "Job timed out after $([math]::Round($elapsed)) minutes.")
+                        $null = $cmd2.Parameters.AddWithValue('@now', $now)
+                        $null = $cmd2.ExecuteNonQuery()
+                        $cmd2.Dispose()
+                        # Re-read the updated row
+                        $cmd3 = $conn2.CreateCommand()
+                        $cmd3.CommandText = 'SELECT * FROM jobs WHERE job_id = @jobId'
+                        $null = $cmd3.Parameters.AddWithValue('@jobId', $jobId)
+                        $reader3 = $cmd3.ExecuteReader()
+                        if ($reader3.Read()) {
+                            $job = [PSCustomObject]@{}
+                            for ($i = 0; $i -lt $reader3.FieldCount; $i++) {
+                                $val = if ($reader3.IsDBNull($i)) { $null } else { $reader3.GetValue($i) }
+                                $job | Add-Member -NotePropertyName $reader3.GetName($i) -NotePropertyValue $val
+                            }
+                        }
+                        $reader3.Dispose(); $cmd3.Dispose()
+                    } finally { $conn2.Dispose() }
                 }
             } catch { }
         }
@@ -932,16 +1120,18 @@ setInterval(poll, 30000);
         if ($job.status -in @('completed', 'failed')) {
             # Persist stats before deleting the job row
             try {
-                Record-JobCompletion -DbPath $dbPath `
-                    -JobId       $job.job_id `
-                    -Status      $job.status `
-                    -DurationMs  ([int]($job.duration_ms)) `
-                    -Suites      $job.suites
+                & $recordCompletion $dbPath $job.job_id $job.status ([int]($job.duration_ms)) $job.suites
             } catch { }
 
-            Invoke-SqliteQuery -DataSource $dbPath -Query @"
-                DELETE FROM jobs WHERE job_id = @jobId
-"@ -SqlParameters @{ jobId = $jobId } -ErrorAction SilentlyContinue
+            $connDel = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$dbPath")
+            try {
+                $connDel.Open()
+                $cmdDel = $connDel.CreateCommand()
+                $cmdDel.CommandText = 'DELETE FROM jobs WHERE job_id = @jobId'
+                $null = $cmdDel.Parameters.AddWithValue('@jobId', $jobId)
+                $null = $cmdDel.ExecuteNonQuery()
+                $cmdDel.Dispose()
+            } finally { $connDel.Dispose() }
 
             try {
                 Get-Job -Name "maester-$($job.job_id)" -ErrorAction SilentlyContinue |
@@ -960,9 +1150,8 @@ setInterval(poll, 30000);
         $maxConcurrent    = $using:MAX_CONCURRENT_JOBS
         $runnerScriptBlock = $using:MaesterRunnerScriptBlock
         $testsPath         = $using:MAESTER_TESTS_PATH
-
-        Import-Module PSSQLite -ErrorAction SilentlyContinue
-        . /app/lib/auth.ps1
+        $getBearerToken    = $using:GetBearerTokenBlock
+        $testTenantId      = $using:TestValidTenantIdBlock
 
         # ── 0. Request size guard (max 64KB body) ─────────────────────────────
         $contentLength = $WebEvent.Request.Headers['Content-Length']
@@ -973,7 +1162,7 @@ setInterval(poll, 30000);
         }
 
         # ── 1. Extract bearer token (MSAL workspace token — proxy auth) ─────────────
-        $rawToken = Get-BearerToken -Headers $WebEvent.Request.Headers
+        $rawToken = & $getBearerToken $WebEvent.Request.Headers
         if (-not $rawToken) {
             $WebEvent.Response.StatusCode = 401
             Write-PodeJsonResponse -Value @{
@@ -1019,7 +1208,7 @@ setInterval(poll, 30000);
             $tenantId = ''
             if ($body.tenantId) {
                 $tenantId = [string]$body.tenantId
-                if (-not (Test-ValidTenantId -TenantId $tenantId)) {
+                if (-not (& $testTenantId $tenantId)) {
                     $WebEvent.Response.StatusCode = 400
                     Write-PodeJsonResponse -Value @{ error = 'Invalid tenantId format. Must be a valid GUID.' }
                     return
@@ -1034,11 +1223,18 @@ setInterval(poll, 30000);
 
         # ── 3. Concurrency guard (per-tenant) ────────────────────────────────
         # One run at a time per tenant. Different tenants may run in parallel.
-        $runningCount = (Invoke-SqliteQuery -DataSource $dbPath -Query @"
-            SELECT COUNT(*) AS cnt FROM jobs WHERE status = 'running' AND tenant_id = @tenantId
-"@ -SqlParameters @{ tenantId = $tenantId }).cnt
+        $connGuard = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$dbPath")
+        $runningCount = 0
+        try {
+            $connGuard.Open()
+            $cmdGuard = $connGuard.CreateCommand()
+            $cmdGuard.CommandText = "SELECT COUNT(*) FROM jobs WHERE status = 'running' AND tenant_id = @tenantId"
+            $null = $cmdGuard.Parameters.AddWithValue('@tenantId', $tenantId)
+            $runningCount = [int]$cmdGuard.ExecuteScalar()
+            $cmdGuard.Dispose()
+        } finally { $connGuard.Dispose() }
 
-        if ([int]$runningCount -ge $maxConcurrent) {
+        if ($runningCount -ge $maxConcurrent) {
             $WebEvent.Response.StatusCode = 409
             Write-PodeJsonResponse -Value @{
                 error = "A Maester test run is already in progress for this tenant. Running two concurrent scans against the same tenant causes Graph API throttling and inconsistent results. Please wait for the current run to complete."
@@ -1050,31 +1246,40 @@ setInterval(poll, 30000);
         $jobId = [guid]::NewGuid().ToString('N')
         $now   = [datetime]::UtcNow.ToString('o')
 
-        Invoke-SqliteQuery -DataSource $dbPath -Query @"
-            INSERT INTO jobs (job_id, status, created_at, updated_at, suites, severity, tenant_id)
-            VALUES (@jobId, 'running', @now, @now, @suites, @severity, @tenantId)
-"@ -SqlParameters @{
-            jobId    = $jobId
-            now      = $now
-            suites   = ($suites   | ConvertTo-Json -Compress)
-            severity = ($severities | ConvertTo-Json -Compress)
-            tenantId = $tenantId
-        }
+        $connIns = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$dbPath")
+        try {
+            $connIns.Open()
+            $cmdIns = $connIns.CreateCommand()
+            $cmdIns.CommandText = "INSERT INTO jobs (job_id, status, created_at, updated_at, suites, severity, tenant_id) VALUES (@jobId, 'running', @now, @now, @suites, @severity, @tenantId)"
+            $null = $cmdIns.Parameters.AddWithValue('@jobId', $jobId)
+            $null = $cmdIns.Parameters.AddWithValue('@now', $now)
+            $null = $cmdIns.Parameters.AddWithValue('@suites', ($suites | ConvertTo-Json -Compress))
+            $null = $cmdIns.Parameters.AddWithValue('@severity', ($severities | ConvertTo-Json -Compress))
+            $null = $cmdIns.Parameters.AddWithValue('@tenantId', $tenantId)
+            $null = $cmdIns.ExecuteNonQuery()
+            $cmdIns.Dispose()
+        } finally { $connIns.Dispose() }
 
         # ── 5. Cleanup expired jobs ──────────────────────────────────────────
         try {
             $hardCutoff      = [datetime]::UtcNow.AddHours(-2).ToString('o')
             $completedCutoff = [datetime]::UtcNow.AddMinutes(-10).ToString('o')
 
-            Invoke-SqliteQuery -DataSource $dbPath -Query @"
-                DELETE FROM jobs WHERE created_at < @cutoff
-"@ -SqlParameters @{ cutoff = $hardCutoff } -ErrorAction SilentlyContinue
+            $connClean = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$dbPath")
+            try {
+                $connClean.Open()
+                $cmdC1 = $connClean.CreateCommand()
+                $cmdC1.CommandText = 'DELETE FROM jobs WHERE created_at < @cutoff'
+                $null = $cmdC1.Parameters.AddWithValue('@cutoff', $hardCutoff)
+                $null = $cmdC1.ExecuteNonQuery()
+                $cmdC1.Dispose()
 
-            Invoke-SqliteQuery -DataSource $dbPath -Query @"
-                DELETE FROM jobs
-                WHERE  status IN ('completed', 'failed')
-                  AND  updated_at < @cutoff
-"@ -SqlParameters @{ cutoff = $completedCutoff } -ErrorAction SilentlyContinue
+                $cmdC2 = $connClean.CreateCommand()
+                $cmdC2.CommandText = "DELETE FROM jobs WHERE status IN ('completed', 'failed') AND updated_at < @cutoff"
+                $null = $cmdC2.Parameters.AddWithValue('@cutoff', $completedCutoff)
+                $null = $cmdC2.ExecuteNonQuery()
+                $cmdC2.Dispose()
+            } finally { $connClean.Dispose() }
         } catch { }
 
         # Cleanup completed PowerShell jobs
@@ -1115,36 +1320,42 @@ setInterval(poll, 30000);
             # 1. Mark stale running jobs as failed
             $cutoff = [datetime]::UtcNow.AddMinutes(-$staleMinutes).ToString('o')
             $now    = [datetime]::UtcNow.ToString('o')
-            Invoke-SqliteQuery -DataSource $dbPath -Query @"
-                UPDATE jobs
-                SET    status = 'failed',
-                       error  = 'Job timed out (cleanup timer). Container may have restarted.',
-                       updated_at = @now
-                WHERE  status = 'running' AND created_at < @cutoff
-"@ -SqlParameters @{ cutoff = $cutoff; now = $now }
+            $conn = $null; $cmd = $null
+            try {
+                $conn = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$dbPath")
+                $conn.Open()
 
-            # 2. Delete expired jobs (>2h old)
-            $hardCutoff = [datetime]::UtcNow.AddHours(-2).ToString('o')
-            Invoke-SqliteQuery -DataSource $dbPath -Query @"
-                DELETE FROM jobs WHERE created_at < @cutoff
-"@ -SqlParameters @{ cutoff = $hardCutoff }
+                $cmd = $conn.CreateCommand()
+                $cmd.CommandText = "UPDATE jobs SET status = 'failed', error = 'Job timed out (cleanup timer). Container may have restarted.', updated_at = @now WHERE status = 'running' AND created_at < @cutoff"
+                $null = $cmd.Parameters.AddWithValue('@cutoff', $cutoff)
+                $null = $cmd.Parameters.AddWithValue('@now',    $now)
+                $null = $cmd.ExecuteNonQuery()
+                $cmd.Dispose(); $cmd = $null
+
+                # 2. Delete expired jobs (>2h old)
+                $hardCutoff = [datetime]::UtcNow.AddHours(-2).ToString('o')
+                $cmd = $conn.CreateCommand()
+                $cmd.CommandText = 'DELETE FROM jobs WHERE created_at < @cutoff'
+                $null = $cmd.Parameters.AddWithValue('@cutoff', $hardCutoff)
+                $null = $cmd.ExecuteNonQuery()
+                $cmd.Dispose(); $cmd = $null
+
+                # 4. Reclaim SQLite space
+                $cmd = $conn.CreateCommand()
+                $cmd.CommandText = 'PRAGMA incremental_vacuum;'
+                $null = $cmd.ExecuteNonQuery()
+            } finally {
+                if ($cmd)  { $cmd.Dispose() }
+                if ($conn) { $conn.Dispose() }
+            }
 
             # 3. Cleanup completed PowerShell thread jobs
             Get-Job | Where-Object { $_.State -in @('Completed', 'Failed') } |
                 Remove-Job -Force -ErrorAction SilentlyContinue
-
-            # 4. Reclaim SQLite space
-            Invoke-SqliteQuery -DataSource $dbPath -Query 'PRAGMA incremental_vacuum;'
         }
         catch { }
 
         # Null out temporary SQL result variables before GC
         $cutoff = $null; $now = $null; $hardCutoff = $null
-
-        # 5. Aggressive GC — collects all generations, compacts LOH, returns memory to OS.
-        [System.Runtime.GCSettings]::LargeObjectHeapCompactionMode = [System.Runtime.GCLargeObjectHeapCompactionMode]::CompactOnce
-        [System.GC]::Collect(2, [System.GCCollectionMode]::Aggressive, $true, $true)
-        [System.GC]::WaitForPendingFinalizers()
-        [System.GC]::Collect(2, [System.GCCollectionMode]::Aggressive, $true, $true)
     }
 }

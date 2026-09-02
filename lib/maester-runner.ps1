@@ -70,30 +70,53 @@ $MaesterRunnerScriptBlock = {
             [string] $ErrorMsg,
             [int]    $DurationMs = 0
         )
-        $now = [datetime]::UtcNow.ToString('o')
-        Invoke-SqliteQuery -DataSource $DbPath -Query @"
-            UPDATE jobs
-            SET    status      = @status,
-                   updated_at  = @now,
-                   result      = @result,
-                   error       = @errorMsg,
-                   duration_ms = @durationMs
-            WHERE  job_id      = @jobId
-"@ -SqlParameters @{
-            jobId      = $JobId
-            status     = $Status
-            now        = $now
-            result     = $Result
-            errorMsg   = $ErrorMsg
-            durationMs = $DurationMs
+        $now  = [datetime]::UtcNow.ToString('o')
+        $conn = $null; $cmd = $null
+        try {
+            $conn = [Microsoft.Data.Sqlite.SqliteConnection]::new("Data Source=$DbPath")
+            $conn.Open()
+            $cmd = $conn.CreateCommand()
+            $cmd.CommandText = 'UPDATE jobs SET status = @status, updated_at = @now, result = @result, error = @errorMsg, duration_ms = @durationMs WHERE job_id = @jobId'
+            $null = $cmd.Parameters.AddWithValue('@jobId',      $JobId)
+            $null = $cmd.Parameters.AddWithValue('@status',     $Status)
+            $null = $cmd.Parameters.AddWithValue('@now',        $now)
+            $null = $cmd.Parameters.AddWithValue('@result',     $(if ($null -ne $Result) { $Result } else { [DBNull]::Value }))
+            $null = $cmd.Parameters.AddWithValue('@errorMsg',   $(if ($null -ne $ErrorMsg) { $ErrorMsg } else { [DBNull]::Value }))
+            $null = $cmd.Parameters.AddWithValue('@durationMs', $DurationMs)
+            $null = $cmd.ExecuteNonQuery()
+        } finally {
+            if ($cmd)  { $cmd.Dispose() }
+            if ($conn) { $conn.Dispose() }
         }
     }
 
     $invocationTempDir = $null
 
     try {
-        # ── 1. Import modules (thread runspaces start empty) ──────────────────
-        Import-Module -Name PSSQLite                       -ErrorAction Stop
+        # ── 1. Load Microsoft.Data.Sqlite assemblies (child process starts clean) ──
+        $_sqliteLibDir = '/app/sqlite-libs'
+        [System.AppDomain]::CurrentDomain.add_AssemblyResolve({
+            param($sender, $resolveArgs)
+            $name = [System.Reflection.AssemblyName]::new($resolveArgs.Name).Name
+            $path = [System.IO.Path]::Combine('/app/sqlite-libs', "$name.dll")
+            if ([System.IO.File]::Exists($path)) {
+                return [System.Reflection.Assembly]::LoadFrom($path)
+            }
+            return $null
+        })
+        @(
+            'SQLitePCLRaw.core.dll'
+            'SQLitePCLRaw.provider.e_sqlite3.dll'
+            'SQLitePCLRaw.batteries_v2.dll'
+            'Microsoft.Data.Sqlite.dll'
+        ) | ForEach-Object {
+            [System.Reflection.Assembly]::LoadFrom(
+                [System.IO.Path]::Combine($_sqliteLibDir, $_)
+            ) | Out-Null
+        }
+        [SQLitePCL.Batteries_V2]::Init()
+
+        # ── 1a. Import modules (child runspaces start empty) ──────────────────
         Import-Module -Name Microsoft.Graph.Authentication -ErrorAction Stop
         Import-Module -Name Pester                         -ErrorAction Stop
         Import-Module -Name Maester                        -ErrorAction Stop
