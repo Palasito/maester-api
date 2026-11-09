@@ -30,3 +30,9 @@ Thumbs.db
 .env
 .env.*
 local.settings.json
+**/bin
+**/obj
+**/TestResults
+.tools
+data
+tests

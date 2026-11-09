@@ -1,0 +1,48 @@
+@baseUrl = http://localhost:7072
+@apiKey = SET_LOCALLY
+@graphToken = SET_LOCALLY
+@jobId = 00000000000000000000000000000000
+
+### Public dashboard
+GET {{baseUrl}}/
+
+### Liveness
+GET {{baseUrl}}/health/live
+
+### Readiness
+GET {{baseUrl}}/health/ready
+
+### Aggregate health and bounded sample history
+GET {{baseUrl}}/health
+
+### Diagnostics
+GET {{baseUrl}}/diag
+
+### Sanitized sample CSV
+GET {{baseUrl}}/diag/log
+
+### Baked inventory
+GET {{baseUrl}}/api/inventory
+X-Functions-Key: {{apiKey}}
+
+### Start a delegated scan (add optional app credential headers locally)
+POST {{baseUrl}}/api/maester
+X-Functions-Key: {{apiKey}}
+Authorization: Bearer {{graphToken}}
+Content-Type: application/json
+
+{"suites":["maester"],"severity":["Critical","High"],"includeLongRunning":false,"includePreview":true}
+
+### Poll; the same completed result can be read repeatedly until expiry
+GET {{baseUrl}}/api/maester?jobId={{jobId}}
+X-Functions-Key: {{apiKey}}
+
+### Invalid identifier
+GET {{baseUrl}}/api/maester?jobId=invalid
+X-Functions-Key: {{apiKey}}
+
+### Unauthorized request
+GET {{baseUrl}}/api/inventory
+
+### Development-only OpenAPI
+GET {{baseUrl}}/openapi/v1.json

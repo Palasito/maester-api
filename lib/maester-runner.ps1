@@ -28,7 +28,9 @@ $MaesterRunnerScriptBlock = {
         [string]   $TestsPath,             # Path to Install-MaesterTests output (fallback: module built-in)
         # App-registration credentials — runner acquires all service tokens itself
         [string]   $MaesterClientId,       # Application (client) ID of the Maester app registration
-        [string]   $MaesterClientSecret    # Client secret value
+        [string]   $MaesterClientSecret,   # Client secret value
+        [string]   $ResultPath,
+        [hashtable] $ServiceTokens
     )
 
     $ErrorActionPreference = 'Stop'
@@ -48,6 +50,10 @@ $MaesterRunnerScriptBlock = {
             [string] $ClientSecret,
             [string] $Scope
         )
+        if ($null -ne $ServiceTokens) {
+            if ($ServiceTokens[$Scope]) { return $ServiceTokens[$Scope] }
+            throw 'Service token acquisition failed.'
+        }
         $body = @{
             grant_type    = 'client_credentials'
             client_id     = $ClientId
@@ -70,6 +76,15 @@ $MaesterRunnerScriptBlock = {
             [string] $ErrorMsg,
             [int]    $DurationMs = 0
         )
+        if ($ResultPath) {
+            $payload = [ordered]@{
+                status = $Status
+                result = if ($Result) { $Result | ConvertFrom-Json -AsHashtable } else { $null }
+                error = $ErrorMsg
+            }
+            [System.IO.File]::WriteAllText($ResultPath, ($payload | ConvertTo-Json -Depth 20 -Compress))
+            return
+        }
         $now  = [datetime]::UtcNow.ToString('o')
         $conn = $null; $cmd = $null
         try {
@@ -94,6 +109,7 @@ $MaesterRunnerScriptBlock = {
 
     try {
         # ── 1. Load Microsoft.Data.Sqlite assemblies (child process starts clean) ──
+        if (-not $ResultPath) {
         $_sqliteLibDir = '/app/sqlite-libs'
         [System.AppDomain]::CurrentDomain.add_AssemblyResolve({
             param($sender, $resolveArgs)
@@ -115,6 +131,7 @@ $MaesterRunnerScriptBlock = {
             ) | Out-Null
         }
         [SQLitePCL.Batteries_V2]::Init()
+        }
 
         # ── 1a. Import modules (child runspaces start empty) ──────────────────
         Import-Module -Name Microsoft.Graph.Authentication -ErrorAction Stop
@@ -340,6 +357,10 @@ $MaesterRunnerScriptBlock = {
         $azureError     = $null
         if ($MaesterClientId -and $MaesterClientSecret -and $TenantId) {
             try {
+                if ($null -ne $ServiceTokens) {
+                    $azureToken = Get-ClientCredentialToken -TenantId $TenantId -ClientId $MaesterClientId -Scope 'https://management.azure.com/.default'
+                    Connect-AzAccount -AccessToken $azureToken -AccountId $MaesterClientId -Tenant $TenantId -ErrorAction Stop | Out-Null
+                } else {
                 $azureSecureSecret = ConvertTo-SecureString $MaesterClientSecret -AsPlainText -Force
                 $azureCred = New-Object System.Management.Automation.PSCredential(
                     $MaesterClientId, $azureSecureSecret
@@ -349,6 +370,7 @@ $MaesterRunnerScriptBlock = {
                     -Credential $azureCred `
                     -Tenant     $TenantId `
                     -ErrorAction Stop | Out-Null
+                }
                 $azureConnected = $true
                 Write-Host '[maester-runner] Azure connected via service principal.'
             }

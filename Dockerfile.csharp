@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1
+FROM mcr.microsoft.com/dotnet/sdk:10.0.401-noble AS build
+WORKDIR /source
+COPY global.json ./
+COPY src/Maester.Api/Maester.Api.csproj src/Maester.Api/
+RUN dotnet restore src/Maester.Api/Maester.Api.csproj
+COPY src/ src/
+COPY worker/ worker/
+COPY lib/maester-runner.ps1 lib/
+RUN dotnet publish src/Maester.Api/Maester.Api.csproj -c Release --no-restore -o /publish /p:UseAppHost=false
+
+FROM mcr.microsoft.com/powershell:ubuntu-noble@sha256:042240d57ec9e47e511033b92625a8d95875ee5860af3015992c248b58a8be81 AS powershell
+
+FROM mcr.microsoft.com/dotnet/aspnet:10.0.12-noble AS runtime
+COPY --from=powershell /opt/microsoft/powershell/7 /opt/microsoft/powershell/7
+RUN ln -s /opt/microsoft/powershell/7/pwsh /usr/bin/pwsh
+COPY build/install-csharp-modules.ps1 /build/install-csharp-modules.ps1
+COPY build/modules.json /build/modules.json
+RUN pwsh -NoLogo -NoProfile -NonInteractive -File /build/install-csharp-modules.ps1
+WORKDIR /app
+COPY --from=build /publish/ ./
+RUN mkdir -p /app/data && chown -R app:app /app/data
+USER app
+ENV ASPNETCORE_HTTP_PORTS=8080 \
+    ASPNETCORE_ENVIRONMENT=Production \
+    MAESTER_DB_PATH=/app/data/maester-csharp.db \
+    Maester__TestsPath=/app/maester-tests
+EXPOSE 8080
+ENTRYPOINT ["dotnet", "Maester.Api.dll"]

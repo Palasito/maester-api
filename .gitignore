@@ -15,3 +15,8 @@
 
 # env files (can opt-in for committing if needed)
 .env*
+**/bin/
+**/obj/
+TestResults/
+data/
+.tools/

@@ -1,0 +1,40 @@
+@page "/"
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Maester | Container Health</title>
+    <link rel="stylesheet" href="/dashboard.css" />
+    <script defer src="/vendor/chart.umd.js"></script>
+    <script defer src="/vendor/lucide.js"></script>
+    <script defer src="/dashboard.js"></script>
+</head>
+<body>
+    <header class="header">
+        <div class="brand"><i data-lucide="activity" aria-hidden="true"></i><div><h1>Maester</h1><p>Container health</p></div></div>
+        <div class="actions"><span id="status" class="status" role="status">Connecting</span><button id="refresh" title="Refresh telemetry" aria-label="Refresh telemetry"><i data-lucide="refresh-cw"></i></button><button id="pause" title="Pause updates" aria-label="Pause updates" aria-pressed="false"><i data-lucide="pause"></i></button><a href="/diag/log" class="icon-button" title="Download health samples" aria-label="Download health samples"><i data-lucide="download"></i></a></div>
+    </header>
+    <nav class="tabs" aria-label="Health views">
+        <button data-view="overview" aria-pressed="true">Overview</button><button data-view="resources" aria-pressed="false">Resources</button><button data-view="runtime" aria-pressed="false">Runtime</button><button data-view="execution" aria-pressed="false">Execution</button><button data-view="diagnostics" aria-pressed="false">Diagnostics</button>
+    </nav>
+    <main>
+        <div id="error" class="error" role="alert" hidden></div>
+        <section class="summary" aria-label="Current resources" data-section="resources">
+            <div><span>Container CPU</span><strong id="cpu">--</strong><small>Allocated CPU usage</small></div>
+            <div><span>Container memory</span><strong id="memory">--</strong><small id="limit">Limit unavailable</small></div>
+            <div><span>Active workers</span><strong id="workers">--</strong><small id="capacity">Capacity unavailable</small></div>
+            <div><span>Uptime</span><strong id="uptime">--</strong><small id="sampled">Waiting for telemetry</small></div>
+        </section>
+        <section class="section" data-section="resources">
+            <div class="section-heading"><h2>Resource Timeline</h2><label>Window <select id="window"><option value="3600">1 hour</option><option value="21600">6 hours</option><option value="86400">24 hours</option></select></label></div>
+            <div class="charts"><div class="chart"><h3>Memory</h3><div class="chart-canvas"><canvas id="memory-chart" aria-label="Process and worker memory history" role="img"></canvas></div></div><div class="chart"><h3>CPU</h3><div class="chart-canvas"><canvas id="cpu-chart" aria-label="Container CPU history" role="img"></canvas></div></div></div>
+        </section>
+        <section class="section" data-section="runtime"><h2>Runtime</h2><dl class="details"><div><dt>Framework</dt><dd id="runtime">--</dd></div><div><dt>Platform</dt><dd id="platform">--</dd></div><div><dt>API version</dt><dd id="version">--</dd></div><div><dt>Scan runtime</dt><dd id="scan-ready">--</dd></div><div><dt>Managed heap</dt><dd id="heap">--</dd></div><div><dt>Committed heap</dt><dd id="committed">--</dd></div><div><dt>Web process RSS</dt><dd id="rss">--</dd></div><div><dt>Worker RSS</dt><dd id="worker-memory">--</dd></div></dl></section>
+        <section class="section" data-section="runtime"><h2>Modules</h2><dl id="modules" class="details"></dl></section>
+        <section class="section" data-section="execution"><h2>Execution</h2><dl class="details"><div><dt>Completed</dt><dd id="completed">--</dd></div><div><dt>Failed</dt><dd id="failed">--</dd></div><div><dt>Active scans</dt><dd id="active">--</dd></div><div><dt>Average duration</dt><dd id="duration">--</dd></div></dl></section>
+        <section class="section" data-section="diagnostics"><h2>Diagnostics</h2><dl class="details"><div><dt>GC collections (0 / 1 / 2)</dt><dd id="gc">--</dd></div><div><dt>Process threads</dt><dd id="threads">--</dd></div><div><dt>Working set</dt><dd id="working-set">--</dd></div><div><dt>SQLite files</dt><dd id="database">--</dd></div><div><dt>Free disk space</dt><dd id="disk">--</dd></div><div><dt>Sampling interval</dt><dd id="interval">--</dd></div></dl></section>
+    </main>
+    <footer><span>Maester runtime monitor</span><span id="last-updated">No samples received</span></footer>
+</body>
+</html>

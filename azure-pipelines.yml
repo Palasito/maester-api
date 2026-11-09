@@ -80,17 +80,17 @@ stages:
                     --yes
                 done
                 
-          - task: AzureCLI@2
-            displayName: 'Deploy container to Function App (managed identity)'
-            inputs:
-              azureSubscription: $(azureSubscription)
-              scriptType: 'bash'
-              scriptLocation: 'inlineScript'
-              inlineScript: |
-                # Use system-assigned managed identity for ACR pull auth.
-                # Requires the Function App's managed identity to have AcrPull on the ACR.
-                az functionapp config container set \
-                  --name $(functionAppName) \
-                  --resource-group rg-websvc-prod-sdc-001 \
-                  --image $(acrLoginServer)/$(imageName):$(imageTag) \
-                  --registry-server https://$(acrLoginServer)
+          # - task: AzureCLI@2
+          #   displayName: 'Deploy container to Function App (managed identity)'
+          #   inputs:
+          #     azureSubscription: $(azureSubscription)
+          #     scriptType: 'bash'
+          #     scriptLocation: 'inlineScript'
+          #     inlineScript: |
+          #       # Use system-assigned managed identity for ACR pull auth.
+          #       # Requires the Function App's managed identity to have AcrPull on the ACR.
+          #       az functionapp config container set \
+          #         --name $(functionAppName) \
+          #         --resource-group rg-websvc-prod-sdc-001 \
+          #         --image $(acrLoginServer)/$(imageName):$(imageTag) \
+          #         --registry-server https://$(acrLoginServer)

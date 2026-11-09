@@ -1,0 +1,8 @@
+{
+  "Maester": "2.3.0",
+  "Pester": "5.7.1",
+  "Microsoft.Graph.Authentication": "2.41.2",
+  "ExchangeOnlineManagement": "3.10.1",
+  "MicrosoftTeams": "8.0.0",
+  "Az.Accounts": "5.5.4"
+}
