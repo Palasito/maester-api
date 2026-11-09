@@ -53,7 +53,7 @@ stages:
                   --registry $(acrName) \
                   --image $(imageName):$(imageTag) \
                   --image $(imageName):latest \
-                  --file ./Dockerfile \
+                  --file ./Dockerfile.csharp \
                   .
 
           - task: AzureCLI@2
